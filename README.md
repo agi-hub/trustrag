@@ -132,39 +132,94 @@ sudo sed -i '/transocr.conf/a\\tinclude snippets/trustrag.conf;' /etc/nginx/site
 sudo nginx -t && sudo nginx -s reload
 ```
 
-## 知识库格式要求
+## 文献入库
 
-### 目录结构
+TrustRAG 不直接读 PDF，而是用 `convert.py` 将 PDF 转换为带页码标记的 Markdown，供搜索引擎使用。
+
+### 三目录体系
 
 ```
-knowledge_base/             ← MD_ROOT 指向这里
-├── doc1.md                 ← Markdown 文档
-├── doc2.md
-├── images/                 ← 图片目录（与 .md 同级或子目录）
-│   ├── doc1-fig1.png
-│   └── doc2-fig1.png
-├── 子目录/
-│   ├── doc3.md
-│   └── images/
-│       └── doc3-fig1.png
-└── source/                 ← PDF 原件目录（可选）
-    ├── doc1.pdf
-    └── doc2.pdf
+项目根目录/
+├── source/      ← 放原始 PDF（你只需要关心这里）
+├── KB/          ← 自动生成：Markdown + 抽取的图片（搜索引擎读这里）
+└── MENU/        ← 自动生成：章节目录 TOC（浏览导航用）
 ```
 
-### Markdown 内嵌标记
+- **你只需把 PDF 放进 `source/`**，然后运行入库命令，其余目录自动同步。
+- `source/` 的子目录结构会被镜像到 `KB/` 和 `MENU/` 中，方便定位。
+- 每个 PDF 在 `KB/` 中生成同名子文件夹（存放 `.md` 和 `images/`）。
 
-每个 `.md` 文件需要在内容中包含页码标记（由 `convert.py` 自动生成）：
+```
+source/
+└── HotChips/2025/report.pdf
+    ↓ python convert.py --ingest
+KB/
+└── HotChips/2025/report/
+    ├── report.md          ← 可搜索的 Markdown
+    └── images/             ← 抽取的图片
+MENU/
+└── HotChips/2025/report-toc.md  ← 章节目录
+```
+
+### 批量入库（推荐）
+
+扫描 `source/` 下所有 PDF，增量同步到 `KB/` 和 `MENU/`：
+
+```bash
+python convert.py --ingest
+```
+
+增量检测基于 `KB/.manifest.json`（记录每个 PDF 的 size/mtime/sha256）：
+
+| 场景 | 行为 |
+|---|---|
+| 新增 PDF | 自动转换 |
+| PDF 内容修改 | 重算 SHA-256，内容变了才重转 |
+| PDF 被删除 | 自动清理对应的 KB/MENU 产物和空目录 |
+| 无变化 | 跳过（按 size+mtime 快速判断，不重算哈希）|
+
+强制全量重转（忽略缓存）：
+
+```bash
+python convert.py --ingest --force
+```
+
+自定义目录：
+
+```bash
+python convert.py --ingest --source /path/to/pdfs --kb /path/to/KB --menu /path/to/MENU
+```
+
+### 单文件转换
+
+转换单个 PDF 为 Markdown（不写入 manifest，不走增量流程）：
+
+```bash
+python convert.py input.pdf -o output.md
+```
+
+常用选项：
+
+```bash
+python convert.py input.pdf --dpi 300          # 提高图片分辨率
+python convert.py input.pdf --no-images        # 不抽取图片
+python convert.py input.pdf --no-page-markers  # 不插入页码标记
+python convert.py input.pdf --table-strategy text  # 表格识别策略
+```
+
+### Markdown 页码标记
+
+入库生成的每个 `.md` 文件内嵌页码标记，搜索引擎据此定位原文位置：
 
 ```html
 <!-- page: 13 | book: FPGA数字IC知识手册 | chapter: 一、 FPGA/IC设计 > 11. 毛刺glitch -->
 ```
 
-用 PDF 转换工具生成带标记的 Markdown：
+由 `convert.py` 自动生成，无需手动添加。
 
-```bash
-python convert.py input.pdf
-```
+### 入库后启动搜索
+
+入库完成后，`KB/` 目录即为知识库。确保 `.env` 或启动参数中 `MD_ROOT` 指向 `KB/`，然后重启服务即可搜索新文献。
 
 ## 服务管理
 
@@ -185,10 +240,10 @@ cd rag-web && npm run build && systemctl restart trustrag
 ## 项目结构
 
 ```
-pymupdftest/
-├── install.sh              ← 一键安装脚本
-├── convert.py              ← PDF → Markdown 转换工具
+trustrag/
+├── convert.py              ← PDF → Markdown 转换 + 批量入库
 ├── rag_search.py           ← RAG 搜索引擎（CLI）
+├── install.sh              ← 一键安装脚本
 ├── rag-web/                ← Web 应用
 │   ├── server.js           ← 后端（Express + SSE）
 │   ├── src/
@@ -199,9 +254,8 @@ pymupdftest/
 │   │       └── exportUtils.js       ← Word 导出
 │   ├── vite.config.js      ← Vite 配置（base 路径）
 │   └── package.json
-├── KB/                     ← 知识库（Markdown 文档）
-│   ├── *.md
-│   └── images/
-└── source/                 ← PDF 原件
-    └── *.pdf
+├── source/                 ← 放入原始 PDF
+├── KB/                     ← 自动生成：Markdown + 图片（搜索引擎读这里）
+│   └── .manifest.json      ← 增量入库指纹缓存
+└── MENU/                   ← 自动生成：章节目录 TOC
 ```
