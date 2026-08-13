@@ -1,0 +1,24 @@
+# 依赖与编译产物
+node_modules/
+dist/
+__pycache__/
+*.pyc
+
+# 环境变量（含密钥，勿提交）
+.env
+
+# 临时文件
+.rag-temp-report.md
+rag-result-*.md
+
+# 知识库与源文件（内容不纳入版本管理）
+KB/*
+source/*
+MENU/*
+!KB/.gitkeep
+!source/.gitkeep
+!MENU/.gitkeep
+
+# 系统文件
+.DS_Store
+Thumbs.db
