@@ -2,6 +2,7 @@ import express from 'express';
 import https from 'https';
 import http from 'http';
 import cors from 'cors';
+import { StringDecoder } from 'string_decoder';
 import { spawn } from 'child_process';
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { join, dirname, resolve as resolvePath } from 'path';
@@ -272,7 +273,7 @@ function _matchSnippet(context, snippets) {
   return bestSnip || snippets[0];
 }
 
-app.post('/api/summarize', async (req, res) => {
+app.post('/api/summarize', (req, res) => {
   const { query, reportMd } = req.body;
   if (!reportMd || !reportMd.trim()) {
     return res.status(400).json({ error: '报告内容为空' });
@@ -330,28 +331,22 @@ app.post('/api/summarize', async (req, res) => {
 
 ${llmSource}`;
 
-  try {
-    const body = JSON.stringify({
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
-      max_tokens: 4096,
-    });
-    const resp = await httpPostJson(
-      `${baseUrl}chat/completions`,
-      { 'Authorization': `Bearer ${apiKey}` },
-      body
-    );
-    const data = resp.json();
-    let summary = data.choices?.[0]?.message?.content || '';
+  // ── SSE 流式响应头 ──
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
 
-    // ── 后处理 ──
+  // ── 引用后处理函数（流结束后调用） ──
+  function postProcessCitations(rawText) {
+    let summary = rawText;
     // 1) 去掉 LLM 可能生成的引用列表
     summary = summary.replace(/\n#{0,6}\s*引用列表[\s\S]*$/m, '');
 
-    // 2) 内容匹配：对每个 [引用N]，按上下文关键词匹配到正确的源片段（不依赖编号正确性）
-    const original = summary;  // replace 回调中的 offset 指向原始字符串
-    const citationOrder = [];  // 按首次出现顺序排列的去重引用
+    // 2) 内容匹配：对每个 [引用N]，按上下文关键词匹配到正确的源片段
+    const original = summary;
+    const citationOrder = [];
     const citationSeen = new Set();
 
     summary = summary.replace(/\[(?:引用\s*)?(\d[\d\s,]*)\]/g, (_match, numsStr, offset) => {
@@ -359,7 +354,6 @@ ${llmSource}`;
       const context = original.substring(Math.max(0, offset - 150), Math.min(original.length, offset + 30));
       const parts = [];
       for (const num of nums) {
-        // 优先按编号匹配源片段，匹配不到再按上下文内容匹配
         let best = sourceSnippets.find(s => s.n === parseInt(num));
         if (!best) best = _matchSnippet(context, sourceSnippets);
         if (best) {
@@ -375,7 +369,7 @@ ${llmSource}`;
       return parts.length ? parts.join(', ') : _match;
     });
 
-    // 3) 自动生成干净的引用列表（仅含正文实际引用的，按出现顺序编号）
+    // 3) 自动生成干净的引用列表
     if (citationOrder.length) {
       let refList = '\n\n---\n\n### 引用列表\n';
       citationOrder.forEach((ref, i) => {
@@ -383,10 +377,114 @@ ${llmSource}`;
       });
       summary += refList;
     }
-    res.json({ summary });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    return summary;
   }
+
+  // ── 流式调用智谱 API ──
+  const reqBody = JSON.stringify({
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0.1,
+    max_tokens: 4096,
+    stream: true,
+  });
+
+  const lib = baseUrl.startsWith('https') ? https : http;
+  const u = new URL(`${baseUrl}chat/completions`);
+  const zhipuReq = lib.request({
+    hostname: u.hostname,
+    port: u.port || (u.protocol === 'https:' ? 443 : 80),
+    path: u.pathname + u.search,
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(reqBody),
+    },
+  }, (zhipuResp) => {
+    if (zhipuResp.statusCode !== 200) {
+      let errBody = '';
+      zhipuResp.on('data', c => errBody += c);
+      zhipuResp.on('end', () => {
+        sendSSE(res, { type: 'error', error: `智谱API错误 ${zhipuResp.statusCode}: ${errBody.slice(0, 200)}` });
+        res.end();
+      });
+      return;
+    }
+
+    let buf = '';
+    let fullText = '';
+    let pendingFlush = '';
+
+    const utf8Decoder = new StringDecoder('utf-8');
+    zhipuResp.on('data', (chunk) => {
+      buf += utf8Decoder.write(chunk);
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data: ')) continue;
+        const payload = trimmed.slice(6);
+        if (payload === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(payload);
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (delta) {
+            fullText += delta;
+            pendingFlush += delta;
+            // 每累积约 10 个字符就推送给前端
+            if (pendingFlush.length >= 10) {
+              sendSSE(res, { type: 'chunk', text: pendingFlush });
+              pendingFlush = '';
+            }
+          }
+        } catch (e) { /* 忽略解析失败的行 */ }
+      }
+    });
+
+    zhipuResp.on('end', () => {
+      // flush UTF-8 decoder 剩余字节
+      buf += utf8Decoder.end();
+      // 处理 buffer 中残留的最后一行
+      if (buf.trim().startsWith('data: ')) {
+        const payload = buf.trim().slice(6);
+        if (payload !== '[DONE]') {
+          try {
+            const parsed = JSON.parse(payload);
+            const delta = parsed.choices?.[0]?.delta?.content;
+            if (delta) { fullText += delta; pendingFlush += delta; }
+          } catch (e) { }
+        }
+      }
+      // 推送最后不足 10 字的残余
+      if (pendingFlush) {
+        sendSSE(res, { type: 'chunk', text: pendingFlush });
+        pendingFlush = '';
+      }
+      // 后处理引用 → 发送最终版
+      try {
+        const finalSummary = postProcessCitations(fullText);
+        sendSSE(res, { type: 'done', summary: finalSummary });
+      } catch (e) {
+        sendSSE(res, { type: 'error', error: '引用后处理失败: ' + e.message });
+      }
+      res.end();
+    });
+
+    zhipuResp.on('error', (e) => {
+      sendSSE(res, { type: 'error', error: e.message });
+      res.end();
+    });
+  });
+
+  zhipuReq.on('error', (e) => {
+    sendSSE(res, { type: 'error', error: e.message });
+    res.end();
+  });
+
+  zhipuReq.write(reqBody);
+  zhipuReq.end();
 });
 
 // ── 获取文件列表 ──

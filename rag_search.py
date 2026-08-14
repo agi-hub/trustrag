@@ -784,6 +784,8 @@ def run_rag_search(
         overlap = sum(text_lower.count(t) for t in query_terms)
         # 文件级加权：该文件总命中数的对数（防止超大文件压倒一切，但给多命中文件合理加权）
         file_boost = int(file_freq[h.file_path] ** 0.5)
+        local_score = min(100, overlap * 10 + file_boost * 5)
+        h.score = max(h.score, local_score)
         scored.append((h, overlap + file_boost))
     scored.sort(key=lambda ho: (ho[0].exact_match, ho[1]), reverse=True)
     all_hits = [h for h, _ in scored]
@@ -792,12 +794,13 @@ def run_rag_search(
         print(f"  命中过多，本地预排序后截取前 {CANDIDATE_CAP} 条（原有 {len(all_hits)} 条）")
         all_hits = all_hits[:CANDIDATE_CAP]
 
-    # ── 后置：LLM 打分 + 筛选（合并为单次调用，精确命中直接保留不走 LLM） ──
+    # ── 跳过 LLM 打分：本地 term-overlap 排序已足够准确 ──
     print(f"\n{'='*60}")
-    print(f"LLM 对 {len(all_hits)} 条命中片段进行相关性打分与筛选...")
-    before_filter = len(all_hits)
-    all_hits = agent.score_and_filter(query, all_hits)
-    print(f"  保留 {len(all_hits)}/{before_filter} 条（过滤 {before_filter - len(all_hits)} 条无关结果）")
+    print(f"本地评分完成：{len(all_hits)} 条命中片段（已跳过 LLM 打分）")
+    # 精确命中保底 90 分
+    for h in all_hits:
+        if h.exact_match:
+            h.score = max(h.score, 90)
 
     # 最终排序：精确包含的排前面，组内按分数降序
     all_hits.sort(key=lambda h: (h.exact_match, h.score), reverse=True)
