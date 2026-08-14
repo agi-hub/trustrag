@@ -354,19 +354,25 @@ ${llmSource}`;
     const citationOrder = [];  // 按首次出现顺序排列的去重引用
     const citationSeen = new Set();
 
-    summary = summary.replace(/\[(?:引用)?(\d{1,2})\]/g, (_match, _num, offset) => {
+    summary = summary.replace(/\[(?:引用\s*)?(\d[\d\s,]*)\]/g, (_match, numsStr, offset) => {
+      const nums = numsStr.match(/\d+/g) || [];
       const context = original.substring(Math.max(0, offset - 150), Math.min(original.length, offset + 30));
-      const best = _matchSnippet(context, sourceSnippets);
-      if (best) {
-        const key = best.path + ':' + best.line;
-        if (!citationSeen.has(key)) {
-          citationSeen.add(key);
-          citationOrder.push(best);
+      const parts = [];
+      for (const num of nums) {
+        // 优先按编号匹配源片段，匹配不到再按上下文内容匹配
+        let best = sourceSnippets.find(s => s.n === parseInt(num));
+        if (!best) best = _matchSnippet(context, sourceSnippets);
+        if (best) {
+          const key = best.path + ':' + best.line;
+          if (!citationSeen.has(key)) {
+            citationSeen.add(key);
+            citationOrder.push(best);
+          }
+          const seqN = citationOrder.findIndex(c => c.path === best.path && c.line === best.line) + 1;
+          parts.push(`⟦FILE:${best.path}⟧L${best.line}⟧[引用${seqN}]⟦/FILE⟧`);
         }
-        const seqN = citationOrder.findIndex(c => c.path === best.path && c.line === best.line) + 1;
-        return `⟦FILE:${best.path}⟧L${best.line}⟧[引用${seqN}]⟦/FILE⟧`;
       }
-      return _match;
+      return parts.length ? parts.join(', ') : _match;
     });
 
     // 3) 自动生成干净的引用列表（仅含正文实际引用的，按出现顺序编号）
