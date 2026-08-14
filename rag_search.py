@@ -335,6 +335,7 @@ def search_markdown(
     round_num: int,
     context_lines: int = CONTEXT_LINES,
     max_hits_per_kw: int = 50,
+    max_hits_per_file: int = 3,
     no_filter: bool = False,
 ) -> list[SearchHit]:
     """在所有 Markdown 文件中搜索关键词，返回命中片段（含上下文+元数据）。
@@ -342,8 +343,8 @@ def search_markdown(
     用 ripgrep (rg) 做底层全文扫描（比纯 Python 逐行正则快 10-30 倍），
     一次并集扫描拿到所有命中（文件+行号+命中的具体词），再只读取命中文件
     抽取上下文和 <!-- page --> 元数据。
-    每个 keyword 最多保留 max_hits_per_kw 个命中，防止泛化词淹没结果。
-    no_filter=True 时跳过 _is_valid_keyword 过滤（用于用户原始查询词）。
+    每个文件最多保留 max_hits_per_file 个命中（防止高频文件淹没其他文件），
+    每个关键词全局最多 max_hits_per_kw 个命中。
     """
     if no_filter:
         valid_keywords = [kw.strip() for kw in keywords if kw.strip()]
@@ -362,57 +363,81 @@ def search_markdown(
 
     hits: list[SearchHit] = []
     seen_keys: set[str] = set()
-    kw_hit_count: dict[str, int] = {kw: 0 for kw in valid_keywords}
-
-    # 按关键词分组：每个关键词最多 max_hits_per_kw 条（保持原语义）
-    # matches 内部已按 (文件,行号) 升序
+    # 按关键词分组：matches 内部已按 (文件,行号) 升序
     per_kw: dict[str, list[tuple[Path, int, str]]] = {}
     for fpath, lineno, matched_kw in matches:
         per_kw.setdefault(matched_kw, []).append((fpath, lineno, matched_kw))
 
+    # ── 轮询分配：保证所有文件平等获得配额 ──
+    # 先每文件各取 1 条，不够 max_hits_per_kw 再取第 2 轮、第 3 轮...
+    # 这样高频文件不会因为排在前面而霸占全部配额
+    selected: list[tuple[Path, int, str]] = []
+    for kw in valid_keywords:
+        # 按文件分组该关键词的所有匹配
+        per_file: dict[str, list[tuple[Path, int, str]]] = {}
+        file_order: list[str] = []
+        for fpath, lineno, k in per_kw.get(kw, []):
+            fkey = str(fpath)
+            if fkey not in per_file:
+                per_file[fkey] = []
+                file_order.append(fkey)
+            per_file[fkey].append((fpath, lineno, k))
+        # 自适应每文件上限：文件少时放宽，文件多时收紧（保证多样性）
+        n_files = len(file_order)
+        adaptive_cap = max(max_hits_per_file, max_hits_per_kw // max(1, n_files))
+        file_idx = {fkey: 0 for fkey in file_order}
+        remaining = max_hits_per_kw
+        for round_i in range(adaptive_cap):
+            if remaining <= 0:
+                break
+            for fkey in file_order:
+                if remaining <= 0:
+                    break
+                idx = file_idx[fkey]
+                matches_list = per_file[fkey]
+                if idx < len(matches_list):
+                    selected.append(matches_list[idx])
+                    file_idx[fkey] += 1
+                    remaining -= 1
+
     # 命中的文件统一读取一次并缓存行 + 元数据索引（避免重复读大文件）
     file_cache: dict[str, tuple[list[str], list[int]]] = {}
 
-    for kw in valid_keywords:
-        count = 0
-        for fpath, lineno, _ in per_kw.get(kw, []):
-            if count >= max_hits_per_kw:
-                break
-            # 读取文件（带缓存），并预建页码元数据索引
-            fkey = str(fpath)
-            if fkey not in file_cache:
-                try:
-                    flines = fpath.read_text(encoding="utf-8").splitlines()
-                except Exception:
-                    file_cache[fkey] = ([], [])
-                    continue
-                # 预计算每行所属的 page meta 索引（O(n) 一次扫完，替代原 O(i) 反向扫描）
-                meta_idx = _build_meta_index(flines)
-                file_cache[fkey] = (flines, meta_idx)
-            flines, meta_idx = file_cache[fkey]
-            if not flines:
+    for fpath, lineno, kw in selected:
+        # 读取文件（带缓存），并预建页码元数据索引
+        fkey = str(fpath)
+        if fkey not in file_cache:
+            try:
+                flines = fpath.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                file_cache[fkey] = ([], [])
                 continue
-            i = lineno - 1  # 0-based
-            # 跳过行首为注释标记的命中（保留原语义）
-            if i < len(flines) and flines[i].lstrip().startswith("<!--"):
-                continue
-            start = max(0, i - context_lines)
-            end = min(len(flines), i + context_lines + 1)
-            text = "\n".join(flines[start:end])
-            meta = _meta_at(meta_idx, i, flines)
-            hit = SearchHit(
-                file_path=str(fpath),
-                line_start=start + 1,
-                line_end=end,
-                text=text,
-                meta=meta,
-                matched_keyword=kw,
-                round_num=round_num,
-            )
-            if hit.key() not in seen_keys:
-                seen_keys.add(hit.key())
-                hits.append(hit)
-                count += 1
+            # 预计算每行所属的 page meta 索引（O(n) 一次扫完，替代原 O(i) 反向扫描）
+            meta_idx = _build_meta_index(flines)
+            file_cache[fkey] = (flines, meta_idx)
+        flines, meta_idx = file_cache[fkey]
+        if not flines:
+            continue
+        i = lineno - 1  # 0-based
+        # 跳过行首为注释标记的命中（保留原语义）
+        if i < len(flines) and flines[i].lstrip().startswith("<!--"):
+            continue
+        start = max(0, i - context_lines)
+        end = min(len(flines), i + context_lines + 1)
+        text = "\n".join(flines[start:end])
+        meta = _meta_at(meta_idx, i, flines)
+        hit = SearchHit(
+            file_path=str(fpath),
+            line_start=start + 1,
+            line_end=end,
+            text=text,
+            meta=meta,
+            matched_keyword=kw,
+            round_num=round_num,
+        )
+        if hit.key() not in seen_keys:
+            seen_keys.add(hit.key())
+            hits.append(hit)
 
     return hits
 
@@ -639,18 +664,18 @@ def run_rag_search(
     all_seen_keys: set[str] = set()
     round_logs: list[RoundLog] = []
     all_keywords_used: list[str] = []
+    exact_search = False  # 精确命中模式：不走 LLM，放宽上限
 
     # ── 第1轮：先用查询词本身试搜，精确命中则跳过 LLM 拆词 ──
     query_clean = query.strip()
     print(f"\n{'='*60}")
     quick_hits = search_markdown(md_files, [query_clean], round_num=1, no_filter=True) if query_clean else []
     quick_exact = any(query_clean.lower() in h.text.lower() for h in quick_hits)
-
     if quick_exact:
-        # 原文直接包含查询词 → 无需 LLM 扩展，直接用查询词作为唯一关键词
         keywords = [query_clean]
-        hits = quick_hits
-        print(f"首轮直接命中查询词，跳过 LLM 关键词拆解（省 1 次调用）")
+        exact_search = True
+        hits = search_markdown(md_files, [query_clean], round_num=1, no_filter=True, max_hits_per_kw=100)
+        print(f"首轮直接命中查询词，跳过 LLM 关键词拆解（省 1 次调用），放宽上限至 100 条")
     else:
         # 原文无该词 → 调 LLM 拆解同义词/扩展词
         print("第1轮搜索：LLM 解析查询，拆解关键词...")
@@ -749,18 +774,23 @@ def run_rag_search(
     query_terms = [t.lower() for t in tokenize_query(query) if len(t) >= 2]
     if query_lower and query_lower not in query_terms:
         query_terms.append(query_lower)
+    # 文件级频次：命中次数多的文件整体更相关（避免高频文件的单条片段被低频文件挤掉）
+    from collections import Counter as _Counter
+    file_freq = _Counter(h.file_path for h in all_hits)
     scored: list[tuple[SearchHit, int]] = []
     for h in all_hits:
         text_lower = h.text.lower()
         h.exact_match = query_lower in text_lower
         overlap = sum(text_lower.count(t) for t in query_terms)
-        scored.append((h, overlap))
+        # 文件级加权：该文件总命中数的对数（防止超大文件压倒一切，但给多命中文件合理加权）
+        file_boost = int(file_freq[h.file_path] ** 0.5)
+        scored.append((h, overlap + file_boost))
     scored.sort(key=lambda ho: (ho[0].exact_match, ho[1]), reverse=True)
     all_hits = [h for h, _ in scored]
-    LLM_CANDIDATE_CAP = 20
-    if len(all_hits) > LLM_CANDIDATE_CAP:
-        print(f"  命中过多，本地预排序后截取前 {LLM_CANDIDATE_CAP} 条（原有 {len(all_hits)} 条）")
-        all_hits = all_hits[:LLM_CANDIDATE_CAP]
+    CANDIDATE_CAP = 100 if exact_search else 20
+    if len(all_hits) > CANDIDATE_CAP:
+        print(f"  命中过多，本地预排序后截取前 {CANDIDATE_CAP} 条（原有 {len(all_hits)} 条）")
+        all_hits = all_hits[:CANDIDATE_CAP]
 
     # ── 后置：LLM 打分 + 筛选（合并为单次调用，精确命中直接保留不走 LLM） ──
     print(f"\n{'='*60}")

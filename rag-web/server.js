@@ -245,6 +245,33 @@ app.post('/api/find-pdf', (req, res) => {
   }
 });
 // ── AI 整理总结 API ──
+// 内容匹配辅助：从文本中提取关键词（英文词 + 中文2-gram）
+function _extractTokens(text) {
+  const tokens = [];
+  const enWords = text.match(/[a-zA-Z]{3,}/g) || [];
+  tokens.push(...enWords.map(w => w.toLowerCase()));
+  const cjk = text.match(/[\u4e00-\u9fff]+/g) || [];
+  for (const seg of cjk) {
+    for (let i = 0; i <= seg.length - 2; i++) tokens.push(seg.substring(i, i + 2));
+  }
+  return tokens;
+}
+
+// 内容匹配：按上下文关键词找到最佳匹配的源片段（不依赖 LLM 的编号正确性）
+function _matchSnippet(context, snippets) {
+  if (!snippets.length) return null;
+  const tokens = _extractTokens(context);
+  if (!tokens.length) return snippets[0];
+  let bestScore = 0, bestSnip = null;
+  for (const snip of snippets) {
+    const lower = snip.text.toLowerCase();
+    let score = 0;
+    for (const w of tokens) { if (lower.includes(w)) score++; }
+    if (score > bestScore) { bestScore = score; bestSnip = snip; }
+  }
+  return bestSnip || snippets[0];
+}
+
 app.post('/api/summarize', async (req, res) => {
   const { query, reportMd } = req.body;
   if (!reportMd || !reportMd.trim()) {
@@ -254,30 +281,29 @@ app.post('/api/summarize', async (req, res) => {
   const baseUrl = ragConfig.base_url;
   const model = process.env.RAG_MODEL || ragConfig.model;
 
-  // ── 提取引用映射：把 ⟦FILE:path⟧L行号⟧name⟦/FILE⟧ 标记替换为简洁的 [引用N]，LLM 输出后再还原为可点击链接 ──
-  const citationMap = []; // [{ n, path, line, name }]
-  const refSeen = new Set();
-  let llmSource = reportMd
-    .replace(/⟦PDF:.+?⟧.+?⟦\/PDF⟧/g, '')     // 去掉 PDF 标记（LLM 不需要）
-    .replace(/\s*\|\s*PDF文件：\s*/g, '')      // 去掉残留的 "PDF文件：" 残文
-    .replace(/⟦FILE:(.+?)⟧L(\d+)⟧(.+?)⟦\/FILE⟧/g, (_, path, line, name) => {
-      const key = path + ':' + line;
-      let n;
-      if (refSeen.has(key)) {
-        n = citationMap.findIndex(c => c.key === key) + 1;
-      } else {
-        refSeen.add(key);
-        n = citationMap.length + 1;
-        citationMap.push({ n, key, path, line: parseInt(line), name });
-      }
-      return `[引用${n}]`;
+  // ── 解析源文件片段：从 reportMd 的 ### 【N】原文摘抄 块提取文本和位置 ──
+  const sourceSnippets = [];
+  const blockRe = /### 【(\d+)】原文摘抄\s*\n([\s\S]*?)\n>\s*相关性[\s\S]*?⟦FILE:(.+?)⟧L(\d+)⟧(.+?)⟦\/FILE⟧/g;
+  let bm;
+  while ((bm = blockRe.exec(reportMd)) !== null) {
+    sourceSnippets.push({
+      n: parseInt(bm[1]), text: bm[2].trim(),
+      path: bm[3], line: parseInt(bm[4]), name: bm[5],
     });
+  }
+
+  // ── 给 LLM 的源文本：去掉标记，保留 【N】 编号 ──
+  const llmSource = reportMd
+    .replace(/<!--\s*search-keywords:.*?-->/g, '')
+    .replace(/⟦PDF:.+?⟧.+?⟦\/PDF⟧/g, '')
+    .replace(/\s*\|\s*PDF文件：\s*/g, '')
+    .replace(/⟦FILE:.+?⟧L\d+⟧.+?⟦\/FILE⟧/g, '（见原文）');
 
   const prompt = `你是技术文献分析助手。以下是基于查询"${query}"的检索结果（原文摘抄），请基于这些内容生成一份结构化总结报告。
 
 【刚性红线 — 违反即为严重错误】
 1. 所有论据必须出自下方检索结果原文，严禁使用任何外部知识、推理、补全或发挥
-2. 每个核心结论必须引用原文出处，标注格式：[引用N]，N 对应原文中的 [引用N] 编号（原文已标注）
+2. 每个核心结论必须引用原文出处，标注格式：[引用N]，N 为原文中的【N】编号
 3. 禁止臆测、推断、融合原文中未明确陈述的信息
 4. 如原文不足以回答某方面问题，必须如实标注，不得编造
 
@@ -290,17 +316,14 @@ app.post('/api/summarize', async (req, res) => {
 ### 表1：核心观点与原文对照
 | 序号 | 核心观点 | 原文摘录 | 出处 |
 |---|---|---|---|
-| 1 | ... | 原文前30字... | [引用N] 文件名 章节 |
+| 1 | ... | 原文前30字... | [引用N] |
 
 ### 表2：未能明确回答或可能不准确的观点
 | 序号 | 问题/观点 | 说明 | 相关度 |
 |---|---|---|---|
 | 1 | ... | 原文未充分覆盖... | 低/中 |
 
-### 引用列表
-[引用1] 文件名，章节信息，行号
-[引用2] ...
-(按报告正文中出现的顺序编号)
+注意：不要自行生成引用列表，系统会自动生成。
 
 ---
 以下是检索结果原文：
@@ -321,14 +344,39 @@ ${llmSource}`;
     );
     const data = resp.json();
     let summary = data.choices?.[0]?.message?.content || '';
-    // 还原引用：[引用N] → 可点击超链接标记（前端 renderReportHtml 会渲染为 <a>）
-    summary = summary.replace(/\[引用(\d+)\]/g, (_, num) => {
-      const ref = citationMap[parseInt(num) - 1];
-      if (ref) {
-        return `⟦FILE:${ref.path}⟧L${ref.line}⟧[引用${num}]⟦/FILE⟧ ⟦PDF:${ref.path}⟧[PDF]⟦/PDF⟧`;
+
+    // ── 后处理 ──
+    // 1) 去掉 LLM 可能生成的引用列表
+    summary = summary.replace(/\n#{0,6}\s*引用列表[\s\S]*$/m, '');
+
+    // 2) 内容匹配：对每个 [引用N]，按上下文关键词匹配到正确的源片段（不依赖编号正确性）
+    const original = summary;  // replace 回调中的 offset 指向原始字符串
+    const citationOrder = [];  // 按首次出现顺序排列的去重引用
+    const citationSeen = new Set();
+
+    summary = summary.replace(/\[(?:引用)?(\d{1,2})\]/g, (_match, _num, offset) => {
+      const context = original.substring(Math.max(0, offset - 150), Math.min(original.length, offset + 30));
+      const best = _matchSnippet(context, sourceSnippets);
+      if (best) {
+        const key = best.path + ':' + best.line;
+        if (!citationSeen.has(key)) {
+          citationSeen.add(key);
+          citationOrder.push(best);
+        }
+        const seqN = citationOrder.findIndex(c => c.path === best.path && c.line === best.line) + 1;
+        return `⟦FILE:${best.path}⟧L${best.line}⟧[引用${seqN}]⟦/FILE⟧`;
       }
-      return `[引用${num}]`;
+      return _match;
     });
+
+    // 3) 自动生成干净的引用列表（仅含正文实际引用的，按出现顺序编号）
+    if (citationOrder.length) {
+      let refList = '\n\n---\n\n### 引用列表\n';
+      citationOrder.forEach((ref, i) => {
+        refList += `- ⟦FILE:${ref.path}⟧L${ref.line}⟧[引用${i + 1}] ${ref.name}⟦/FILE⟧ ⟦PDF:${ref.path}⟧[PDF]⟦/PDF⟧\n`;
+      });
+      summary += refList;
+    }
     res.json({ summary });
   } catch (e) {
     res.status(500).json({ error: e.message });
