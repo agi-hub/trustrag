@@ -42,12 +42,15 @@ bash install.sh /path/to/your/knowledge_base
 安装脚本会自动安装，也可手动安装：
 
 ```bash
-pip install pymupdf4llm jieba openai
+pip install pdf-inspector pymupdf4llm jieba openai
 ```
 
-- `pymupdf4llm`：PDF 转 Markdown 工具
+- `pdf-inspector`：PDF 转 Markdown 工具（**默认**，快速准确）
+- `pymupdf4llm`：PDF 转 Markdown 工具（备选，兼容性好）
 - `jieba`：中文分词（搜索时拆解中文查询词）
 - `openai`：调用智谱 GLM API
+
+**PDF 解析器优先级**：系统优先使用 `pdf-inspector` 进行 PDF 转换（速度提升约36倍，表格准确率0.814），失败时自动回退到 `pymupdf4llm`。可通过 `--force-pymupdf` 参数强制使用 `pymupdf4llm`。
 
 ## 手动安装
 
@@ -58,7 +61,7 @@ pip install pymupdf4llm jieba openai
 ```bash
 cd rag-web
 npm install
-pip install pymupdf4llm jieba openai
+pip install pdf-inspector pymupdf4llm jieba openai
 ```
 
 ### 2. 构建前端
@@ -182,6 +185,19 @@ python convert.py --ingest
 
 ```bash
 python convert.py --ingest --force
+```
+
+**PDF 解析器选择**：
+
+```bash
+# 默认使用 pdf-inspector（快速准确）
+python convert.py input.pdf
+
+# 强制使用 pymupdf4llm
+python convert.py input.pdf --force-pymupdf
+
+# 批量入库时强制使用 pymupdf4llm
+python convert.py --ingest --force-pymupdf
 ```
 
 自定义目录：

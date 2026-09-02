@@ -53,8 +53,8 @@ info "Node.js $(node -v), Python $(python3 --version 2>&1 | awk '{print $2}')"
 # ── 2. Python 依赖 ──
 echo ""
 echo ">>> 安装 Python 依赖..."
-pip3 install -q pymupdf4llm jieba openai 2>/dev/null || pip install -q pymupdf4llm jieba openai
-info "Python 依赖安装完成"
+pip3 install -q pdf-inspector pymupdf4llm jieba openai 2>/dev/null || pip install -q pdf-inspector pymupdf4llm jieba openai
+info "Python 依赖安装完成（pdf-inspector + pymupdf4llm 作为备选）"
 
 # ── 3. 定位项目目录 ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
