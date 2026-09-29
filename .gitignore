@@ -11,6 +11,9 @@ __pycache__/
 .rag-temp-report.md
 rag-result-*.md
 
+# 运行时配置（含密钥，勿提交；模板见 rag-web/config.example.json）
+rag-web/config.json
+
 # 知识库与源文件（内容不纳入版本管理）
 KB/*
 source/*

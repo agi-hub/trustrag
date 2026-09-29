@@ -1,16 +1,19 @@
-# 无幻（TrustRAG）— 无幻觉 RAG 搜索引擎
+# 无幻（TrustRAG）— 富格式无幻觉知识库搜索引擎
 
-> 纯大模型驱动、无 Embedding、无幻觉的 Agentic RAG 系统。所有输出内容 100% 源自 Markdown 原文摘抄。
+> **富格式、零幻觉的知识库全文搜索引擎：纯 CPU 即可运行，大模型可选可不用，无需嵌入向量、无向量数据库 —— 适用于无 LLM 的私有化离线部署场景。**
 
-## 功能
+## 功能特性
 
-- 🔍 **多轮智能搜索**：LLM 自动拆解关键词、迭代搜索、筛选无关结果
-- 📄 **原文摘抄输出**：零幻觉，所有内容逐字源自知识库
-- 📊 **相关性打分**：精确命中优先 + LLM 语义打分排序
-- 🤖 **AI 整理总结**：结构化总结报告，引用列表 + 观点对照表
-- 📕 **PDF 预览**：点击链接直接在新标签页预览原始 PDF
+- 🚫 **大模型是可选项**：LLM 仅用于查询关键词扩展，可开可关——`config.json` 设 `use_llm: false` 或 CLI 加 `--no-llm` 即自动降级为 jieba 本地分词，离线功能完整可用
+- 💻 **纯 CPU 即可运行**：检索、排序、报告全程零 GPU、零模型推理，无需购置任何额外设备
+- 🔬 **知识库全文深入检索**：ripgrep 全文并集扫描 + 多轮迭代深挖；支持分号分隔多关键词，逐词汇报命中与扩展情况
+- 🧩 **无需嵌入向量与嵌入模型**：不保存 embedding、不建向量库；reranker 亦为可选项——本地词法打分开箱即用，精度按需升级
+- 📝 **检索报告（可导出 Word）**：程序化生成「检索综述 + 原文摘抄 + 搜索路径日志」，引述逐字可溯源，零幻觉；一键导出 .docx 报告
+- ⚡ **快速多轮次检索**：多遍全文扫描单进程完成，千级文档库 3 秒内出结果
+- 📚 **多格式全文检索**：PDF / Word / PPT / Excel / Markdown 统一转换为 Markdown 入库，正文、表格、插图全部可搜
+- 🖼️ **图像索引与召回**：入库时自动抽取文档插图，检索报告按命中片段汇总「检索图示」，可回看原文对应页
+- 📕 **PDF 原文预览**：点击资料链接直接在新标签页预览原始 PDF 对应位置
 - 🌐 **Web 界面**：标签页式浏览，搜索状态实时显示
-- 📥 **导出 Word**：一键导出搜索报告
 
 ## 快速安装
 
@@ -42,15 +45,14 @@ bash install.sh /path/to/your/knowledge_base
 安装脚本会自动安装，也可手动安装：
 
 ```bash
-pip install pdf-inspector pymupdf4llm jieba openai
+pip install pdf-inspector pymupdf4llm jieba openai python-docx python-pptx openpyxl
 ```
 
 - `pdf-inspector`：PDF 转 Markdown 工具（**默认**，快速准确）
 - `pymupdf4llm`：PDF 转 Markdown 工具（备选，兼容性好）
 - `jieba`：中文分词（搜索时拆解中文查询词）
-- `openai`：调用智谱 GLM API
-
-**PDF 解析器优先级**：系统优先使用 `pdf-inspector` 进行 PDF 转换（速度提升约36倍，表格准确率0.814），失败时自动回退到 `pymupdf4llm`。可通过 `--force-pymupdf` 参数强制使用 `pymupdf4llm`。
+- `openai`：调用智谱 GLM API（可选，不用大模型时可卸载）
+- `python-docx` / `python-pptx` / `openpyxl`：Word / PPT / Excel 转 Markdown 入库（纯本地解析）
 
 ## 手动安装
 
@@ -61,7 +63,7 @@ pip install pdf-inspector pymupdf4llm jieba openai
 ```bash
 cd rag-web
 npm install
-pip install pdf-inspector pymupdf4llm jieba openai
+pip install pdf-inspector pymupdf4llm jieba openai python-docx python-pptx openpyxl
 ```
 
 ### 2. 构建前端
@@ -166,19 +168,21 @@ MENU/
 
 ### 批量入库（推荐）
 
-扫描 `source/` 下所有 PDF，增量同步到 `KB/` 和 `MENU/`：
+扫描 `source/` 下所有 PDF / Word / PPT / Excel 文档，增量同步到 `KB/` 和 `MENU/`：
 
 ```bash
 python convert.py --ingest
 ```
 
-增量检测基于 `KB/.manifest.json`（记录每个 PDF 的 size/mtime/sha256）：
+Office 文档（`.docx` / `.pptx` / `.xlsx`）由 python-docx / python-pptx / openpyxl 纯本地解析为 Markdown，正文、表格、插图一并入库；同名不同扩展的文件会自动以扩展名消歧。
+
+增量检测基于 `KB/.manifest.json`（记录每个文档的 size/mtime/sha256）：
 
 | 场景 | 行为 |
 |---|---|
-| 新增 PDF | 自动转换 |
-| PDF 内容修改 | 重算 SHA-256，内容变了才重转 |
-| PDF 被删除 | 自动清理对应的 KB/MENU 产物和空目录 |
+| 新增文档 | 自动转换 |
+| 文档内容修改 | 重算 SHA-256，内容变了才重转 |
+| 文档被删除 | 自动清理对应的 KB/MENU 产物和空目录 |
 | 无变化 | 跳过（按 size+mtime 快速判断，不重算哈希）|
 
 强制全量重转（忽略缓存）：
@@ -237,6 +241,25 @@ python convert.py input.pdf --table-strategy text  # 表格识别策略
 
 入库完成后，`KB/` 目录即为知识库。确保 `.env` 或启动参数中 `MD_ROOT` 指向 `KB/`，然后重启服务即可搜索新文献。
 
+## 搜索使用
+
+### 多关键词查询
+
+Web 搜索框或 CLI 均支持分号分隔的多个关键词（中英文分号皆可），每个关键词独立判定「是否直接命中 → 是否需要扩展」，结果合并去重后生成一份报告，报告开头会逐个汇报命中情况：
+
+```bash
+python rag_search.py -q "HBM 带宽; chiplet 互连" -d KB -o report.md
+```
+
+### 关键词扩展方式
+
+原始查询词在知识库中无直接命中时，系统会扩展关键词（同义词/子词）再检索，并在报告中提醒。扩展方式由 `rag-web/config.json` 的 `use_llm` 控制（首次使用请复制 `rag-web/config.example.json` 为 `config.json` 后修改，`config.json` 含密钥不入库）：
+
+| 配置 | 扩展方式 | 说明 |
+|---|---|---|
+| `"use_llm": true`（默认） | LLM（任意 OpenAI 兼容端点） | 同义词质量高；在 `config.json` 配置 `api_key`/`base_url`/`model`，LLM 失败时自动回退 jieba |
+| `"use_llm": false` 或 CLI `--no-llm` | jieba 本地分词 | 无 API 依赖、离线可用，中文复合词拆解（如「显存带宽」→ 显存 + 带宽） |
+
 ## 服务管理
 
 ```bash
@@ -257,8 +280,7 @@ cd rag-web && npm run build && systemctl restart trustrag
 
 ```
 trustrag/
-├── convert.py              ← PDF → Markdown 转换 + 批量入库
-├── rag_search.py           ← RAG 搜索引擎（CLI）
+├── convert.py              ← PDF/Word/PPT/Excel → Markdown 转换 + 批量入库
 ├── install.sh              ← 一键安装脚本
 ├── rag-web/                ← Web 应用
 │   ├── server.js           ← 后端（Express + SSE）

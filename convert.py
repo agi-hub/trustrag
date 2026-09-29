@@ -592,6 +592,227 @@ def _remove_empty_dirs(root: Path, start: Path) -> None:
             break
 
 
+# ── Office 文档转换（Word/PPT/Excel → Markdown） ─────────────────────
+
+_OFFICE_EXTS = {".docx", ".pptx", ".xlsx"}
+
+
+def _md_escape_cell(text) -> str:
+    """表格单元格文本转 Markdown 安全字符串（转义竖线、压掉换行）。"""
+    return str(text).replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
+def _md_table(rows: list[list[str]]) -> list[str]:
+    """二维字符串数组 → Markdown 表格行（自动补齐列数、跳过空行）。"""
+    rows = [r for r in rows if any(r)]
+    if not rows:
+        return []
+    ncol = max(len(r) for r in rows)
+    out = ["| " + " | ".join(rows[0] + [""] * (ncol - len(rows[0]))) + " |",
+           "|" + "---|" * ncol]
+    for r in rows[1:]:
+        out.append("| " + " | ".join(r + [""] * (ncol - len(r))) + " |")
+    out.append("")
+    return out
+
+
+def _save_image_blob(blob: bytes, image_dir: Path, prefix: str, seq: int) -> str | None:
+    """把图片二进制写入 md 同级的 images/ 目录，返回相对引用路径；失败返回 None."""
+    if not blob:
+        return None
+    try:
+        import imghdr
+        ext = imghdr.what(None, blob) or "png"
+    except Exception:
+        ext = "png"
+    try:
+        image_dir.mkdir(parents=True, exist_ok=True)
+        target = image_dir / f"{prefix}-img{seq}.{ext}"
+        target.write_bytes(blob)
+        return f"images/{target.name}"
+    except Exception as exc:
+        print(f"  图片写入失败: {exc}")
+        return None
+
+
+def docx_to_md(path: Path, output: Path, write_images: bool) -> str:
+    """Word (.docx) → Markdown：标题层级、段落、表格，内联图附文末."""
+    try:
+        import docx
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+    except ImportError:
+        sys.exit("缺少依赖：pip install python-docx")
+
+    d = docx.Document(str(path))
+    title = (d.core_properties.title or "").strip() or path.stem
+    lines: list[str] = [f"# {title}\n"]
+    image_dir = output.parent / "images"
+    img_seq = 0
+    img_refs: list[str] = []
+
+    # 按文档顺序遍历正文元素（段落与表格交错）
+    for child in d.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            para = Paragraph(child, d)
+            text = para.text.strip()
+            if not text:
+                continue
+            style = (para.style.name or "").lower()
+            m = re.match(r"heading (\d+)", style)
+            if "title" in style:
+                lines.append(f"## {text}\n")
+            elif m:
+                level = min(int(m.group(1)) + 1, 6)
+                lines.append(f"{'#' * level} {text}\n")
+            else:
+                lines.append(text + "\n")
+        elif tag == "tbl":
+            rows = [[_md_escape_cell(c.text) for c in row.cells] for row in Table(child, d).rows]
+            lines.extend(_md_table(rows))
+
+    # 内联图片统一附在文末（docx 结构中图片锚点与文本分离）
+    if write_images:
+        try:
+            for shp in d.inline_shapes:
+                try:
+                    rId = shp._inline.graphic.graphicData.pic.blipFill.blip.embed
+                    blob = d.part.related_parts[rId].blob
+                except Exception:
+                    continue
+                ref = _save_image_blob(blob, image_dir, path.stem, img_seq)
+                img_seq += 1
+                if ref:
+                    img_refs.append(ref)
+        except Exception:
+            pass
+    if img_refs:
+        lines.append("\n## 文档插图\n")
+        lines.extend(f"![{path.stem} 插图{i + 1}]({ref})\n" for i, ref in enumerate(img_refs))
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines), encoding="utf-8")
+    return str(output)
+
+
+def pptx_to_md(path: Path, output: Path, write_images: bool) -> str:
+    """PPT (.pptx) → Markdown：每页一节（标题/文本/表格/图片按版面顺序）."""
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    except ImportError:
+        sys.exit("缺少依赖：pip install python-pptx")
+
+    prs = Presentation(str(path))
+    title = (prs.core_properties.title or "").strip() or path.stem
+    lines: list[str] = [f"# {title}\n"]
+    image_dir = output.parent / "images"
+    img_seq = 0
+
+    for i, slide in enumerate(prs.slides, 1):
+        lines.append(f"\n## 第 {i} 页\n")
+        title_shape = slide.shapes.title
+        title_shape_id = title_shape.shape_id if title_shape is not None else None
+        if title_shape is not None and title_shape.text.strip():
+            lines.append(f"### {title_shape.text.strip()}\n")
+        for shape in slide.shapes:
+            if title_shape_id is not None and shape.shape_id == title_shape_id:
+                continue
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                if write_images:
+                    try:
+                        ref = _save_image_blob(
+                            shape.image.blob, image_dir, f"{path.stem}-p{i}", img_seq
+                        )
+                        img_seq += 1
+                        if ref:
+                            lines.append(f"![第{i}页插图]({ref})\n")
+                    except Exception:
+                        pass
+                continue
+            if getattr(shape, "has_table", False) and shape.has_table:
+                rows = [[_md_escape_cell(c.text) for c in row.cells] for row in shape.table.rows]
+                lines.extend(_md_table(rows))
+                continue
+            if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+                txt = "\n".join(
+                    p.text for p in shape.text_frame.paragraphs if p.text.strip()
+                ).strip()
+                if txt:
+                    lines.append(txt + "\n")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines), encoding="utf-8")
+    return str(output)
+
+
+def xlsx_to_md(path: Path, output: Path, write_images: bool) -> str:
+    """Excel (.xlsx) → Markdown：每个工作表一节，首行作表头，附工作表图片."""
+    try:
+        import openpyxl
+    except ImportError:
+        sys.exit("缺少依赖：pip install openpyxl")
+
+    wb = openpyxl.load_workbook(str(path), data_only=True)
+    title = (wb.properties.title or "").strip() or path.stem
+    lines: list[str] = [f"# {title}\n"]
+    image_dir = output.parent / "images"
+    img_seq = 0
+    for ws in wb.worksheets:
+        rows: list[list[str]] = []
+        for row in ws.iter_rows(values_only=True):
+            cells = ["" if v is None else _md_escape_cell(v) for v in row]
+            while cells and not cells[-1]:
+                cells.pop()
+            if any(cells):
+                rows.append(cells)
+        if not rows:
+            continue
+        lines.append(f"\n## {ws.title}\n")
+        lines.extend(_md_table(rows))
+        # 工作表内嵌图片附在本节末尾
+        if write_images:
+            for img in getattr(ws, "_images", []):
+                try:
+                    blob = img._data()
+                except Exception:
+                    continue
+                ref = _save_image_blob(blob, image_dir, f"{path.stem}-{ws.title}", img_seq)
+                img_seq += 1
+                if ref:
+                    lines.append(f"![{ws.title} 插图]({ref})\n")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines), encoding="utf-8")
+    return str(output)
+
+
+def convert_office(path: str, output: str | None = None, *, write_images: bool = True) -> str:
+    """转换单个 Word/PPT/Excel 文档为 Markdown 并写盘，返回输出路径.
+
+    纯本地解析（python-docx / python-pptx / openpyxl），无外部服务、无模型推理。
+    """
+    p = Path(path).resolve()
+    if not p.exists():
+        sys.exit(f"文件不存在: {p}")
+    ext = p.suffix.lower()
+    if ext == ".docx":
+        return docx_to_md(p, Path(output).resolve() if output else p.with_suffix(".md"), write_images)
+    if ext == ".pptx":
+        return pptx_to_md(p, Path(output).resolve() if output else p.with_suffix(".md"), write_images)
+    if ext == ".xlsx":
+        return xlsx_to_md(p, Path(output).resolve() if output else p.with_suffix(".md"), write_images)
+    sys.exit(f"不支持的 Office 格式: {ext}（支持 .docx/.pptx/.xlsx）")
+
+
+def convert_any(path: str, output: str | None = None, **kwargs) -> str:
+    """按扩展名分派：Office 文档走 convert_office，其余按 PDF 转换."""
+    if Path(path).suffix.lower() in _OFFICE_EXTS:
+        return convert_office(path, output, write_images=kwargs.get("write_images", True))
+    return convert(path, output, **kwargs)
+
+
 def ingest(
     source_dir: str,
     kb_dir: str | None = None,
@@ -608,15 +829,13 @@ def ingest(
     page_markers: bool = True,
     merge_paragraphs: bool = True,
 ) -> list[str]:
-    """批量增量入库：扫描 source/ 下所有 PDF，同步到 KB/、MENU/.
+    """批量增量入库：扫描 source/ 下所有 PDF/Word/PPT/Excel，同步到 KB/、MENU/.
 
     目录镜像：source/ 的相对子目录结构在 KB/ 与 MENU/ 中原样重建；
-    每个源 PDF 生成：
-      - KB/<相对路径>.md（正文，含页码标记）
-      - MENU/<相对父目录>/<stem>-toc.md（章节目录）
-
+    每个源文档生成：
+      - KB/<相对路径>.md（正文；PDF 含页码标记，MENU 章节目录仅 PDF 生成）
     增量策略：
-      - 按 SHA-256 内容指纹检测变更，仅转换新增或修改的 PDF.
+      - 按 SHA-256 内容指纹检测变更，仅转换新增或修改的文档.
       - 保留 .manifest.json 记录已处理文件的指纹，支持断点续传和删除同步.
 
     Args:
@@ -640,16 +859,19 @@ def ingest(
     menu.mkdir(parents=True, exist_ok=True)
 
     manifest = load_manifest(kb)
-    pdfs = sorted(source.rglob("*.pdf"))
-    current_rels = {p.relative_to(source).as_posix() for p in pdfs}
+    docs = sorted(
+        p for p in source.rglob("*")
+        if p.is_file() and (p.suffix.lower() == ".pdf" or p.suffix.lower() in _OFFICE_EXTS)
+    )
+    current_rels = {p.relative_to(source).as_posix() for p in docs}
 
-    if not pdfs and not manifest:
-        print(f"source 中未找到 PDF: {source}")
+    if not docs and not manifest:
+        print(f"source 中未找到可入库文档（PDF/Word/PPT/Excel）: {source}")
         return []
 
-    print(f"入库: {len(pdfs)} 个 PDF  | source={source}")
-    print(f"      KB={kb}")
-    print(f"      MENU={menu}")
+    n_office = sum(1 for p in docs if p.suffix.lower() in _OFFICE_EXTS)
+    print(f"入库: {len(docs)} 个文档（PDF {len(docs) - n_office} / Office {n_office}）  | source={source}")
+
 
     # ── 1) 删除同步：manifest 中存在、source 中已不存在的文件 ──
     removed = 0
@@ -659,14 +881,24 @@ def ingest(
         print(f"  删除(源已移除): {rel_key}")
         removed += 1
 
-    # ── 2) 新增/修改：遍历当前 source PDF ──
+    # ── 2) 新增/修改：遍历当前 source 文档 ──
+    # 同名不同扩展（如 a.docx / a.xlsx）会映射到同一个 .md → 加扩展名消歧
+    stem_seen: dict[tuple[str, str], int] = {}
+    for p in docs:
+        key = (str(p.parent), p.stem.lower())
+        stem_seen[key] = stem_seen.get(key, 0) + 1
     generated: list[str] = []
     skipped = 0
-    for pdf in pdfs:
+    for pdf in docs:
         rel = pdf.relative_to(source)
         rel_key = rel.as_posix()
         # 镜像目录结构：KB/<相对路径>.md ; MENU/<相对父目录>/<stem>-toc.md
-        kb_md = kb / rel.with_suffix(".md")
+        dup = stem_seen[(str(pdf.parent), pdf.stem.lower())] > 1
+        kb_rel = (
+            rel.with_name(f"{pdf.stem}-{pdf.suffix.lstrip('.')}.md") if dup
+            else rel.with_suffix(".md")
+        )
+        kb_md = kb / kb_rel
         menu_md = menu / rel.parent / (rel.stem + "-toc.md")
 
         st = pdf.stat()
@@ -695,22 +927,26 @@ def ingest(
             continue
 
         kb_md.parent.mkdir(parents=True, exist_ok=True)
-        menu_md.parent.mkdir(parents=True, exist_ok=True)
         print(f"\n→ {rel_key}")
-        out = convert(
-            str(pdf),
-            output=str(kb_md),
-            toc_output=str(menu_md),
-            dpi=dpi,
-            write_images=write_images,
-            image_format=image_format,
-            table_strategy=table_strategy,
-            auto_footer=auto_footer,
-            extra_footer_patterns=extra_footer_patterns,
-            page_markers=page_markers,
-            merge_paragraphs=merge_paragraphs,
-            force_pymupdf=force_pymupdf,
-        )
+        if pdf.suffix.lower() in _OFFICE_EXTS:
+            # Office 文档：纯本地解析，无章节目录（MENU toc 仅 PDF 生成）
+            out = convert_office(str(pdf), output=str(kb_md), write_images=write_images)
+        else:
+            menu_md.parent.mkdir(parents=True, exist_ok=True)
+            out = convert(
+                str(pdf),
+                output=str(kb_md),
+                toc_output=str(menu_md),
+                dpi=dpi,
+                write_images=write_images,
+                image_format=image_format,
+                table_strategy=table_strategy,
+                auto_footer=auto_footer,
+                extra_footer_patterns=extra_footer_patterns,
+                page_markers=page_markers,
+                merge_paragraphs=merge_paragraphs,
+                force_pymupdf=force_pymupdf,
+            )
         generated.append(out)
         manifest[rel_key] = {
             "size": st.st_size, "mtime": st.st_mtime, "sha256": digest,
@@ -719,14 +955,15 @@ def ingest(
     save_manifest(kb, manifest)
     print(
         f"\n入库完成: 转换 {len(generated)}，跳过 {skipped}，"
-        f"删除 {removed}，共 {len(pdfs)} 个源文件"
+        f"删除 {removed}，共 {len(docs)} 个源文件"
     )
     return generated
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="PDF -> Markdown 高精度转换")
-    ap.add_argument("pdf", nargs="?", help="输入 PDF 路径（单文件模式）")
+    ap = argparse.ArgumentParser(description="PDF/Word/PPT/Excel → Markdown 转换与入库")
+    ap.add_argument("pdf", nargs="?", help="输入文档路径（单文件模式，支持 .pdf/.docx/.pptx/.xlsx）")
+
     ap.add_argument("-o", "--output", help="输出 .md 路径（默认同名 .md）")
     ap.add_argument("--dpi", type=int, default=200, help="图片分辨率 (默认 200)")
     ap.add_argument("--no-images", action="store_true", help="不抽取图片")
@@ -793,9 +1030,9 @@ def main() -> None:
         return
 
     if not args.pdf:
-        ap.error("单文件模式需要 PDF 路径；批量入库请加 --ingest")
+        ap.error("单文件模式需要文档路径（.pdf/.docx/.pptx/.xlsx）；批量入库请加 --ingest")
 
-    convert(
+    convert_any(
         args.pdf,
         args.output,
         dpi=args.dpi,

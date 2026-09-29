@@ -278,9 +278,11 @@ app.post('/api/summarize', (req, res) => {
   if (!reportMd || !reportMd.trim()) {
     return res.status(400).json({ error: '报告内容为空' });
   }
-  const apiKey = process.env.ZHIPU_API_KEY || ragConfig.api_key;
-  const baseUrl = ragConfig.base_url;
-  const model = process.env.RAG_MODEL || ragConfig.model;
+  // 与 rag_search.py 一致：config.json 为配置真源，环境变量仅兜底；
+  // base_url 统一补尾斜杠（openai SDK 自动容错，此处手拼 URL 必须自带）
+  const apiKey = ragConfig.api_key || process.env.ZHIPU_API_KEY;
+  const baseUrl = (ragConfig.base_url || process.env.ZHIPU_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4/').replace(/\/?$/, '/');
+  const model = ragConfig.model || process.env.RAG_MODEL || 'glm-4-flash';
 
   // ── 解析源文件片段：从 reportMd 的 ### 【N】原文摘抄 块提取文本和位置 ──
   const sourceSnippets = [];
@@ -300,34 +302,18 @@ app.post('/api/summarize', (req, res) => {
     .replace(/\s*\|\s*PDF文件：\s*/g, '')
     .replace(/⟦FILE:.+?⟧L\d+⟧.+?⟦\/FILE⟧/g, '（见原文）');
 
-  const prompt = `你是技术文献分析助手。以下是基于查询"${query}"的检索结果（原文摘抄），请基于这些内容生成一份结构化总结报告。
+  const prompt = `你是技术文献整理助手。请阅读下面的检索结果摘抄，把其中的核心观点分类整理成一份报告。
 
-【刚性红线 — 违反即为严重错误】
-1. 所有论据必须出自下方检索结果原文，严禁使用任何外部知识、推理、补全或发挥
-2. 每个核心结论必须引用原文出处，标注格式：[引用N]，N 为原文中的【N】编号
-3. 禁止臆测、推断、融合原文中未明确陈述的信息
-4. 如原文不足以回答某方面问题，必须如实标注，不得编造
+整理要求：
+1. 只使用检索结果中的信息，禁止编造或补充任何摘抄之外的内容。
+2. 第一行输出标题"## 观点整理"，随后按主题分类：每个分类用一行"### 分类名"作小标题，分类下面逐条列出该主题的观点，每条观点占一行，行首用"- "。
+3. 覆盖检索结果中的全部核心观点，一条都不遗漏；摘抄里有多少个观点就整理多少条。
+4. 忠实呈现原文表述，不要压缩、合并或过度概括；保留原文的关键数据与术语（芯片型号、带宽数值、容量、倍数、技术名称）。
+5. 每条观点的句末标注来源编号：方括号加数字，编号取自摘抄中的【数字】，例如：……显著缩短了首token时延[3]。一条观点可标多个编号，如[2][5]。禁止把编号放在句首，禁止输出"[编号]""[引用N]"这类占位文字。
+6. 只写技术内容本身，禁止出现"在检索过程中""摘抄显示""本文分析了"这类描述检索行为或自指的话。
+7. 除标题、分类名和观点条目外，不要输出任何其他文字。
 
-【输出格式】
-## 总结报告
-(2-4段总结性文字，每段核心观点后标注[引用N])
-
-## 附录
-
-### 表1：核心观点与原文对照
-| 序号 | 核心观点 | 原文摘录 | 出处 |
-|---|---|---|---|
-| 1 | ... | 原文前30字... | [引用N] |
-
-### 表2：未能明确回答或可能不准确的观点
-| 序号 | 问题/观点 | 说明 | 相关度 |
-|---|---|---|---|
-| 1 | ... | 原文未充分覆盖... | 低/中 |
-
-注意：不要自行生成引用列表，系统会自动生成。
-
----
-以下是检索结果原文：
+检索结果摘抄：
 
 ${llmSource}`;
 
@@ -341,11 +327,23 @@ ${llmSource}`;
   // ── 引用后处理函数（流结束后调用） ──
   function postProcessCitations(rawText) {
     let summary = rawText;
-    // 1) 去掉 LLM 可能生成的引用列表
-    summary = summary.replace(/\n#{0,6}\s*引用列表[\s\S]*$/m, '');
+    // 0) 清理 LLM 原样照抄的占位符（小模型会发明各种写法：[引用N]/[编号]/[源引12]…）
+    summary = summary.replace(
+      /\s*\[(?:引用|源引|来源|引证|编号|ref|cite)\s*(?:N|n|#|编号|\d+)?\s*\]/gi,
+      ''
+    );
+    // 剥掉正文开头的检索元话语（标题行之后，如"在检索过程中，重点关注了……，"）
+    summary = summary.replace(
+      /(^##[^\n]*\n+)(?:在)?(?:检索|搜索)(?:过程中|结果中)[^。\n]{0,60}?[,，]/,
+      '$1'
+    );
+    // 1) 去掉 LLM 自行生成的引用列表/参考文献区（系统会自动生成干净的版本）
+    summary = summary.replace(/\n#{0,6}\s*(?:参考文献|引用列表|参考来源|来源列表)[^\n]*[\s\S]*$/i, '');
+    // 1.5) 分类主题行（- **xxx**）上的引用编号移除：主题行不承担引用，引用归观点行
+    summary = summary.replace(/^(\s*-\s*\*\*[^*]+\*\*)\s*\[(?:引用\s*)?\d[\d\s,]*\]\s*$/gm, '$1');
+    const original = summary;
 
     // 2) 内容匹配：对每个 [引用N]，按上下文关键词匹配到正确的源片段
-    const original = summary;
     const citationOrder = [];
     const citationSeen = new Set();
 
@@ -368,6 +366,24 @@ ${llmSource}`;
       }
       return parts.length ? parts.join(', ') : _match;
     });
+
+    // 2.5) 兜底：小模型常漏标来源编号——观点行若没有任何引用角标，按内容匹配自动补一条
+    summary = summary.split('\n').map(line => {
+      const t = line.trim();
+      if (!t || t.length < 15) return line;                 // 空行/标题/主题短语不补
+      if (t.startsWith('#') || t.startsWith('---')) return line;
+      if (/^-\s*\*\*/.test(t)) return line;                 // 分类主题行不补
+      if (line.includes('⟦FILE:')) return line;             // 已有角标
+      const best = _matchSnippet(line, sourceSnippets);
+      if (!best) return line;
+      const key = best.path + ':' + best.line;
+      if (!citationSeen.has(key)) {
+        citationSeen.add(key);
+        citationOrder.push(best);
+      }
+      const seqN = citationOrder.findIndex(c => c.path === best.path && c.line === best.line) + 1;
+      return `${line}⟦FILE:${best.path}⟧L${best.line}⟧[引用${seqN}]⟦/FILE⟧`;
+    }).join('\n');
 
     // 3) 自动生成干净的引用列表
     if (citationOrder.length) {
@@ -406,7 +422,7 @@ ${llmSource}`;
       let errBody = '';
       zhipuResp.on('data', c => errBody += c);
       zhipuResp.on('end', () => {
-        sendSSE(res, { type: 'error', error: `智谱API错误 ${zhipuResp.statusCode}: ${errBody.slice(0, 200)}` });
+        sendSSE(res, { type: 'error', error: `LLM API错误 ${zhipuResp.statusCode}: ${errBody.slice(0, 200)}` });
         res.end();
       });
       return;

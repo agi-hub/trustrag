@@ -445,15 +445,6 @@ body {
 .markdown-body ul, .markdown-body ol { padding-left: 1.8em; margin: 0.6em 0; }
 .markdown-body li { margin: 0.3em 0; }
 
-/* 关键词高亮 — 黄底标记 */
-.markdown-body mark.kw-hl {
-  background: #fff3cd;
-  color: inherit;
-  padding: 1px 3px;
-  border-radius: 2px;
-  font-weight: 600;
-}
-
 /* page-meta-link 样式 — 原文超链接 */
 .page-meta-link {
   display: inline-block;
@@ -475,15 +466,17 @@ body {
   text-decoration: none;
 }
 
-/* 文件路径超链接 */
+/* 文件/资料引用：外观与正文一致（视觉普通显示），保留点击跳原文；悬停时提示可点 */
 .file-path-link {
-  color: var(--primary);
+  color: inherit;
   cursor: pointer;
-  font-weight: 600;
-  text-decoration: underline;
+  text-decoration: none;
 }
 
-.file-path-link:hover { color: var(--primary-hover); }
+.file-path-link:hover {
+  color: var(--primary);
+  text-decoration: underline;
+}
 
 /* PDF 链接 */
 .pdf-link {
@@ -602,4 +595,26 @@ body {
 @media (max-width: 768px) {
   .status-sidebar { display: none; }
   .editor-panel { display: none; }
+}
+
+/* ===== AI 总结流式生成预览 ===== */
+.ai-stream-preview {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 14px;
+  line-height: 1.7;
+  color: #d0d7de;
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font-family: inherit;
+}
+.ai-stream-error {
+  color: #f85149;
+  font-size: 14px;
+  padding: 12px 16px;
+  border: 1px solid #f85149;
+  border-radius: 6px;
+  background: rgba(248, 81, 73, 0.08);
 }

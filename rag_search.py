@@ -8,15 +8,22 @@
     # CLI 参数模式
     python rag_search.py -q "Data Pipeline 相关章节" -d ~/pymupdftest -o result.md
 
+    # 多关键词查询（中英文分号均可，每个关键词独立判定命中/扩展）
+    python rag_search.py -q "HBM 带宽; chiplet 互连" -d ~/docs
+
     # 交互模式（进入后输入查询）
     python rag_search.py -d ~/pymupdftest
+
+    # 关键词扩展方式：默认走大模型（config.json 的 use_llm 控制），
+    # 未配置 Key、use_llm: false 或 --no-llm 时使用 jieba 本地分词
+    python rag_search.py -q "显存带宽" -d ~/docs --no-llm
 
     # 指定模型/轮次
     python rag_search.py -q "GPU内存层次" -d ~/docs --max-rounds 5 --model glm-4-flash
 
-环境变量:
-    ZHIPU_API_KEY    智谱 API Key（默认从 k.md 读取的内置值）
-    ZHIPU_BASE_URL   智谱 API 地址（默认 https://open.bigmodel.cn/api/paas/v4/）
+    LLM 端点配置（优先级：CLI 参数 > rag-web/config.json > 环境变量）：
+    ZHIPU_API_KEY    API Key 兜底（config.json 的 api_key 优先）
+    ZHIPU_BASE_URL   API 地址兜底（config.json 的 base_url 优先，OpenAI 兼容接口）
 
 依赖:
     pip install openai
@@ -79,6 +86,7 @@ DEFAULT_BASE_URL = _config.get("base_url", "https://open.bigmodel.cn/api/paas/v4
 DEFAULT_MODEL = _config.get("model", "glm-4-flash")
 DEFAULT_MAX_ROUNDS = 3
 CONTEXT_LINES = 3  # 命中行前后各取多少行作为上下文
+DEFAULT_USE_LLM = bool(_config.get("use_llm", True))  # 是否用大模型扩展关键词；false 时用 jieba
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────
@@ -120,15 +128,27 @@ class SearchHit:
 
 
 @dataclass
+class ExpansionInfo:
+    """单个子查询的关键词扩展信息（供报告开头汇报）。"""
+    sub_query: str
+    expanded: bool = False      # 是否发生了扩展（原词未直接命中）
+    method: str = ""            # 扩展方式：llm / jieba
+    words: list[str] = field(default_factory=list)  # 扩展出的关键词
+    n_direct: int = 0           # 原词直接命中的片段数
+
+
+@dataclass
 class RoundLog:
     """单轮搜索日志。"""
+
     round_num: int
     keywords: list[str]
     hit_files: list[str] = field(default_factory=list)
     new_hits_count: int = 0
     judgment: str = ""
     next_plan: str = ""
-
+    query_label: str = ""       # 多关键词查询时标注所属子查询
+    expansions: list[ExpansionInfo] = field(default_factory=list)  # 本轮产生的扩展信息
 
 # ── Markdown 元数据解析 ────────────────────────────────────────────────
 _PAGE_META_RE = re.compile(
@@ -641,14 +661,54 @@ class LLMAgent:
 
         return kept
 
+def split_queries(query: str) -> list[str]:
+    """按中英文分号把输入拆成多个子查询；无有效内容时返回空列表。"""
+    return [s.strip() for s in re.split(r"[;；]", query) if s.strip()]
+
+
+def _expand_keywords_jieba(query: str) -> list[str]:
+    """无 LLM 时的传统扩展：jieba 搜索引擎模式切子词，过滤停用词/短词/原词。"""
+    if not _HAS_JIEBA:
+        return []
+    words: list[str] = []
+    for w in jieba.cut_for_search(query):
+        w = w.strip()
+        if len(w) >= 2 and w != query and w not in _STOPWORDS and w not in words:
+            words.append(w)
+    return words[:4]
+
+
+def plan_keywords_safe(
+    agent: "LLMAgent | None", query: str, use_llm: bool
+) -> tuple[list[str], str]:
+    """关键词扩展：配置启用且 LLM 可用时走 LLM，否则或失败时回退 jieba 本地分词。
+
+    Returns:
+        (扩展关键词列表, 扩展方式 "llm" / "jieba")
+    """
+    if use_llm and agent is not None:
+        try:
+            kws = agent.plan_keywords(query)
+            if kws:
+                return kws, "llm"
+        except Exception as exc:
+            print(f"  LLM 关键词扩展失败（{exc.__class__.__name__}: {exc}），回退 jieba 本地分词")
+    return _expand_keywords_jieba(query), "jieba"
+
+
 # ── 多轮搜索主循环 ─────────────────────────────────────────────────────
 def run_rag_search(
     query: str,
     md_dir: str,
-    agent: LLMAgent,
+    agent: LLMAgent | None,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
+    use_llm: bool = True,
 ) -> tuple[list[SearchHit], list[RoundLog]]:
-    """执行多轮 Agentic RAG 搜索。
+    """执行 Agentic RAG 搜索，支持分号分隔的多关键词查询。
+
+    多关键词：按分号拆为多个子查询，每个独立做「原词精确命中→扩展关键词」
+    判定后合并去重；迭代深挖仅单子查询时进行。
+    关键词扩展：use_llm 且 agent 可用时走 LLM，禁用或调用失败时回退 jieba 本地分词。
 
     Returns:
         (所有命中片段, 搜索日志列表)
@@ -658,57 +718,75 @@ def run_rag_search(
         print(f"错误：目录 {md_dir} 下未找到 Markdown 文件")
         return [], []
 
+    sub_queries = split_queries(query)
+    if not sub_queries:
+        print("错误：查询为空（或只含分隔符）")
+        return [], []
+
     print(f"已加载 {len(md_files)} 个 Markdown 文件")
 
     all_hits: list[SearchHit] = []
     all_seen_keys: set[str] = set()
     round_logs: list[RoundLog] = []
     all_keywords_used: list[str] = []
-    exact_search = False  # 精确命中模式：不走 LLM，放宽上限
+    exact_search = False  # 任一子查询精确命中：放宽上限
+    multi = len(sub_queries) > 1
 
-    # ── 第1轮：先用查询词本身试搜，精确命中则跳过 LLM 拆词 ──
-    query_clean = query.strip()
-    print(f"\n{'='*60}")
-    quick_hits = search_markdown(md_files, [query_clean], round_num=1, no_filter=True) if query_clean else []
-    quick_exact = any(query_clean.lower() in h.text.lower() for h in quick_hits)
-    if quick_exact:
-        keywords = [query_clean]
-        exact_search = True
-        hits = search_markdown(md_files, [query_clean], round_num=1, no_filter=True, max_hits_per_kw=100)
-        print(f"首轮直接命中查询词，跳过 LLM 关键词拆解（省 1 次调用），放宽上限至 100 条")
-    else:
-        # 原文无该词 → 调 LLM 拆解同义词/扩展词
-        print("第1轮搜索：LLM 解析查询，拆解关键词...")
-        keywords = agent.plan_keywords(query)
-        # 补充原始查询本身（确保精确匹配）
-        if query_clean not in keywords:
-            keywords.insert(0, query_clean)
-        # 限制总共最多 5 个关键词
-        keywords = keywords[:5]
-        hits = search_markdown(md_files, keywords, round_num=1)
+    # ── 第1轮：每个子查询先用原词试搜，精确命中则跳过扩展 ──
+    for sq in sub_queries:
+        tag = f"查询“{sq}”" if multi else ""
+        print(f"\n{'='*60}")
+        quick_hits = search_markdown(md_files, [sq], round_num=1, no_filter=True)
+        quick_exact = any(sq.lower() in h.text.lower() for h in quick_hits)
+        if quick_exact:
+            keywords = [sq]
+            exact_search = True
+            hits = search_markdown(md_files, [sq], round_num=1, no_filter=True, max_hits_per_kw=100)
+            print(f"{tag}直接命中查询词，跳过关键词扩展（省 1 次调用），放宽上限至 100 条")
+        else:
+            # 原文无该词 → 扩展同义词/子词（LLM 或 jieba 本地分词）
+            print(f"第1轮搜索：{tag}扩展关键词（{'LLM' if use_llm and agent is not None else 'jieba 本地分词'}）...")
+            kws, _method = plan_keywords_safe(agent, sq, use_llm)
+            keywords = [sq] + [k for k in kws if k != sq]
+            keywords = keywords[:5]
+            hits = search_markdown(md_files, keywords, round_num=1)
 
-    print(f"  关键词（{len(keywords)}个）：{', '.join(keywords)}")
-    all_keywords_used.extend(keywords)
+        new_count = 0
+        for h in hits:
+            if h.key() not in all_seen_keys:
+                all_seen_keys.add(h.key())
+                all_hits.append(h)
+                new_count += 1
 
-    new_count = 0
-    for h in hits:
-        if h.key() not in all_seen_keys:
-            all_seen_keys.add(h.key())
-            all_hits.append(h)
-            new_count += 1
+        sq_lower = sq.lower()
+        expansion = ExpansionInfo(
+            sub_query=sq,
+            expanded=not quick_exact,
+            method="" if quick_exact else _method,
+            words=[] if quick_exact else keywords[1:],
+            n_direct=sum(1 for h in hits if sq_lower in h.text.lower()),
+        )
+        hit_files = sorted(set(h.file_path for h in hits))
+        if quick_exact:
+            judgment = f"{tag}直接命中 {new_count} 个片段"
+        else:
+            judgment = f"{tag}命中 {new_count} 个片段（扩展词：{', '.join(expansion.words) or '无'}）"
+        round_logs.append(RoundLog(
+            round_num=1,
+            keywords=keywords,
+            hit_files=hit_files,
+            new_hits_count=new_count,
+            judgment=judgment,
+            query_label=sq if multi else "",
+            expansions=[expansion],
+        ))
+        all_keywords_used.extend(keywords)
+        print(f"  {tag}关键词（{len(keywords)}个）：{', '.join(keywords)}")
+        print(f"  {tag}命中文件：{len(hit_files)} 个，新增片段：{new_count}")
 
-    hit_files = sorted(set(h.file_path for h in hits))
-    log = RoundLog(
-        round_num=1,
-        keywords=keywords,
-        hit_files=hit_files,
-        new_hits_count=new_count,
-        judgment=f"第1轮命中 {new_count} 个片段",
-    )
-    round_logs.append(log)
-    print(f"  命中文件：{len(hit_files)} 个，新增片段：{new_count}")
-
-    # ── 迭代搜索 ──
+    # ── 迭代搜索：仅单子查询且启用 LLM 时进行（多关键词/无 LLM 时只搜第 1 轮） ──
+    if multi or agent is None or not use_llm:
+        max_rounds = 1  # 迭代规划依赖 LLM，此模式下跳过迭代
     for round_num in range(2, max_rounds + 1):
         # 第一轮命中已足够多（>10条），跳过后续轮次避免发散
         if len(all_hits) > 10:
@@ -724,9 +802,13 @@ def run_rag_search(
         print(f"第{round_num}轮：LLM 评估信息缺口...")
         # 构造命中摘要给 LLM 判断
         hits_summary = [h.text[:80].replace("\n", " ") for h in all_hits]
-        should_continue, new_keywords, judgment = agent.judge_and_plan(
-            query, all_keywords_used, hits_summary, round_num - 1
-        )
+        try:
+            should_continue, new_keywords, judgment = agent.judge_and_plan(
+                query, all_keywords_used, hits_summary, round_num - 1
+            )
+        except Exception as exc:
+            print(f"  LLM 迭代判定失败（{exc.__class__.__name__}），终止迭代")
+            break
 
         log = RoundLog(
             round_num=round_num,
@@ -770,17 +852,20 @@ def run_rag_search(
 
     # ── 后置：本地 term-overlap 预排序 + 截取前 20 条 ──
     # 用廉价本地相关性排序，只把最相关的少数片段交给 LLM，大幅减少 LLM 处理量与生成耗时
-    query_lower = query.strip().lower()
-    query_terms = [t.lower() for t in tokenize_query(query) if len(t) >= 2]
-    if query_lower and query_lower not in query_terms:
-        query_terms.append(query_lower)
+    sub_lowers = [s.lower() for s in sub_queries]
+    query_terms: list[str] = []
+    for s in sub_queries:
+        for t in tokenize_query(s):
+            t = t.lower()
+            if len(t) >= 2 and t not in query_terms:
+                query_terms.append(t)
     # 文件级频次：命中次数多的文件整体更相关（避免高频文件的单条片段被低频文件挤掉）
     from collections import Counter as _Counter
     file_freq = _Counter(h.file_path for h in all_hits)
     scored: list[tuple[SearchHit, int]] = []
     for h in all_hits:
         text_lower = h.text.lower()
-        h.exact_match = query_lower in text_lower
+        h.exact_match = any(s in text_lower for s in sub_lowers)
         overlap = sum(text_lower.count(t) for t in query_terms)
         # 文件级加权：该文件总命中数的对数（防止超大文件压倒一切，但给多命中文件合理加权）
         file_boost = int(file_freq[h.file_path] ** 0.5)
@@ -856,29 +941,348 @@ def merge_overlapping_hits(hits: list[SearchHit], overlap_threshold: int = 5) ->
 
 
 
-def _extract_keyword_preview(text: str, keywords: list[str], window: int = 120) -> str:
-    """从 text 中找到第一个出现的关键词，截取关键词前后各 window/2 字的窗口。
-    关键词未命中时回退为取开头 window 字。"""
-    lower = text.lower()
-    pos = -1
-    kw_len = 0
-    for kw in keywords:
-        if len(kw) < 2:
-            continue
-        idx = lower.find(kw.lower())
-        if idx >= 0:
-            pos = idx
-            kw_len = len(kw)
+# ── 检索综述生成（纯程序，无 LLM） ────────────────────────────────────
+
+_HIGH_SCORE_THRESHOLD = 85   # 分数 ≥ 85 视为"较高关联度"
+_VERB_SHORT_MAX = 60         # 清理后 ≤60 字 → 提及了
+_VERB_MID_MAX = 250          # 60~250 字 → 阐述了；>250 字 → 论述了
+_QUOTE_MAX_LEN = 300         # 综述中引述原话的最大长度（整句/自然段）
+
+_IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+_TABLE_RE = re.compile(r"(?:^[ \t]*\|.*[ \t]*\|[ \t]*$\n?){2,}", flags=re.MULTILINE)
+
+
+
+def _quote_verb(clean_text: str) -> str:
+    """按片段长度选择动词：提及了（短）/ 阐述了（中长）/ 论述了（长段）。"""
+    n = len(clean_text)
+    if n <= _VERB_SHORT_MAX:
+        return "提及了"
+    if n <= _VERB_MID_MAX:
+        return "阐述了"
+    return "论述了"
+
+
+def _clip_long_sentence(sent: str, max_len: int) -> str:
+    """单句超长时在子句边界（，；、,;）处截断，避免半句话。"""
+    if len(sent) <= max_len:
+        return sent
+    cut = sent[:max_len]
+    for i in range(len(cut) - 1, max_len // 2, -1):
+        if cut[i] in "，；、,;":
+            return cut[: i + 1]
+    return cut
+
+
+def _clean_for_quote(text: str) -> str:
+    """清理原文片段用于综述引述：去 page 注释、图片、表格、markdown 格式符、换行。
+
+    输出为纯文本：无 #/＞/列表符/粗斜体/行内代码标记，无换行，
+    中文字符之间不留空隙。
+    """
+    t = re.sub(r"<!--\s*page:.*?-->", "", text)
+    t = _IMG_RE.sub("", t)
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)   # 链接 → 仅保留文字
+    t = re.sub(r"<[^>]+>", " ", t)                    # HTML/SVG 标签 → 空格
+    t = _TABLE_RE.sub("", t)
+    # 行首格式符：标题 #、引用 >、无序/有序列表（循环剥离嵌套，如 "### 4. 标题"）
+    while True:
+        t2 = re.sub(r"(?m)^(\s*)(#{1,6}|>|[-+*]|\d+\.)\s+", r"\1", t)
+        if t2 == t:
             break
-    if pos < 0:
-        snippet = text[:window]
-        return snippet + ("..." if len(text) > window else "")
-    half = window // 2
-    start = max(0, pos - half)
-    end = min(len(text), pos + kw_len + half)
-    prefix = "..." if start > 0 else ""
-    suffix = "..." if end < len(text) else ""
-    return prefix + text[start:end] + suffix
+        t = t2
+    t = re.sub(r"(?m)^\s*(-{3,}|\*{3,}|_{3,})\s*$", "", t)  # 水平线行删除
+    t = re.sub(r"(?m)^\s*(```|~~~).*$", "", t)      # 代码围栏行整体删除
+    # 粗斜体/粗体/斜体/行内代码标记（保留内部文字，不动 snake_case 下划线）
+    t = re.sub(r"(\*\*\*|___)(?=\S)(.+?)(?<=\S)\1", r"\2", t, flags=re.DOTALL)
+    t = re.sub(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", r"\2", t, flags=re.DOTALL)
+    t = re.sub(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])", r"\1", t)
+    t = re.sub(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])", r"\1", t)
+    t = re.sub(r"`([^`\n]*)`", r"\1", t)
+    t = re.sub(r"[\r\n\t]+", " ", t)                  # 换行 → 空格
+    t = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", t)  # 中文间空隙
+    t = re.sub(r" {2,}", " ", t).strip()
+    return t
+
+
+def _to_plain_text(text: str) -> str:
+    """原文摘抄转纯文本：清除全部 markdown/HTML 格式符，仅保留文字内容。
+
+    与 _clean_for_quote 的区别：保留段落换行，表格转为纯文字行而非删除
+    （详细信息需要完整内容，表格数据不能丢）。
+    """
+    t = re.sub(r"<!--\s*page:.*?-->", "", text)
+    t = _IMG_RE.sub(" ", t)                                   # 图片移除
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)            # 链接 → 文字
+    t = re.sub(r"<[^>]+>", " ", t)                            # HTML/SVG 标签 → 空格
+    t = re.sub(r"(?m)^\s*(```|~~~).*$", "", t)                # 代码围栏行删除
+    t = re.sub(r"(?m)^\s*(-{3,}|\*{3,}|_{3,})\s*$", "", t)    # 水平线行删除
+
+    # 逐行处理：表格行 → 纯文字；行首 标题/引用/列表符 剥离
+    out_lines: list[str] = []
+    for ln in t.split("\n"):
+        s = ln.strip()
+        if s.startswith("|"):
+            s = s.strip("|")
+            if re.fullmatch(r"[ :\-|]*", s):                   # 表格分隔行跳过
+                continue
+            s = " ".join(c.strip() for c in s.split("|") if c.strip())
+        else:
+            # 循环剥离嵌套格式（如 "### 4. 标题" 需剥两层）
+            while True:
+                s2 = re.sub(r"^(#{1,6}|>|[-+*]|\d+\.)\s+", "", s)
+                if s2 == s:
+                    break
+                s = s2
+        out_lines.append(s)
+    t = "\n".join(out_lines)
+
+    # 行内强调/代码标记（成对剥离，不动 snake_case 下划线）
+    t = re.sub(r"(\*\*\*|___)(?=\S)(.+?)(?<=\S)\1", r"\2", t, flags=re.DOTALL)
+    t = re.sub(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", r"\2", t, flags=re.DOTALL)
+    t = re.sub(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])", r"\1", t)
+    t = re.sub(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])", r"\1", t)
+    t = re.sub(r"`([^`\n]*)`", r"\1", t)
+    t = re.sub(r"[ \t]+", " ", t)                             # 压缩空白/缩进
+    t = re.sub(r"(?m)^[ \t]+|[ \t]+$", "", t)                 # 去行首尾空白（保留分段空行）
+    t = re.sub(r"\n{3,}", "\n\n", t)                          # 多空行压缩
+    # 兜底：残余的裸标签起始符转义，防止破坏 DOM
+    t = re.sub(r"<(?=[a-zA-Z/!])", "&lt;", t)
+    return t.strip()
+
+
+def _join_sentences(chosen: list[str]) -> str:
+    """拼接句子：中文句后直接连，英文句后补空格。"""
+    out = ""
+    for s in chosen:
+        if out and out[-1].isascii() and out[-1].isalnum():
+            out += " "
+        out += s
+    return out
+
+
+def _make_quote(clean_text: str, keywords: list[str]) -> str:
+    """提取引述原话：以完整句子为单位，至少一句，累计不超过 _QUOTE_MAX_LEN。
+
+    从首个命中关键词的句子开始，向后续取仍含关键词的相邻句，保持行文
+    连贯且不混入无关内容；首句过短时补一句上下文。不加省略号。
+    """
+    if not clean_text:
+        return ""
+    # 切句：中英文句末标点保留在句尾；无中文句读的纯英文按 ". " 切
+    sents = [s.strip() for s in re.split(r"(?<=[。！？!?])", clean_text) if s.strip()]
+    if len(sents) <= 1:
+        sents = [s.strip() for s in re.split(r"(?<=\.)\s+", clean_text) if s.strip()]
+    if not sents:
+        return clean_text[:_QUOTE_MAX_LEN]
+
+    lower_kw = [k.lower() for k in keywords if k and len(k) >= 2]
+
+    def kw_hit(s: str) -> bool:
+        l = s.lower()
+        return any(k in l for k in lower_kw)
+
+    # 起点：首个命中关键词的句子（无命中则从头开始）
+    start = 0
+    for i, s in enumerate(sents):
+        if kw_hit(s):
+            start = i
+            break
+
+    chosen = [sents[start]]
+    total = len(sents[start])
+    # 后续句子：仍含关键词才继续取
+    for s in sents[start + 1 :]:
+        if total + len(s) > _QUOTE_MAX_LEN or not kw_hit(s):
+            break
+        chosen.append(s)
+        total += len(s)
+    # 首句过短（如列表短行）时补一句上下文
+    nxt = start + len(chosen)
+    if total < 40 and nxt < len(sents) and total + len(sents[nxt]) <= _QUOTE_MAX_LEN:
+        chosen.append(sents[nxt])
+    if total > _QUOTE_MAX_LEN:
+        return _clip_long_sentence("".join(chosen), _QUOTE_MAX_LEN)
+    return _join_sentences(chosen)
+
+
+def _extract_figures(text: str) -> list[tuple[str, str]]:
+    """提取 Markdown 图片，返回 [(alt, path)]。"""
+    return [(m.group(1).strip(), m.group(2).strip()) for m in _IMG_RE.finditer(text)]
+
+
+def _extract_tables(text: str) -> list[str]:
+    """提取 Markdown 表格原文。"""
+    return [m.group(0).strip() for m in _TABLE_RE.finditer(text)]
+
+
+def _summary_intro(expansions: list[ExpansionInfo], n_total: int) -> str:
+    """生成综述开头语：先汇报各原始关键词是否有结果；未命中时提示已扩展关键词。"""
+    if not expansions:
+        return "多轮检索完成，未在 Markdown 仓库中查询到相关原文内容。"
+
+    def _clause(e: ExpansionInfo) -> str:
+        if e.n_direct > 0:
+            return f"“{e.sub_query}”已在知识库中直接命中"
+        if e.expanded and e.words:
+            return (
+                f"未在知识库中直接检索到“{e.sub_query}”，"
+                f"**我们对您的关键词进行了扩展**（{'、'.join(e.words)}）"
+            )
+        if e.expanded:
+            return f"“{e.sub_query}”未检索到相关内容"
+        return f"未在知识库中直接检索到“{e.sub_query}”"
+
+    if len(expansions) == 1:
+        e = expansions[0]
+        if e.n_direct > 0:
+            return (
+                f"您的检索词“{e.sub_query}”已在知识库中直接命中，"
+                f"共检索到 {n_total} 条相关片段，结果如下："
+            )
+        tail = ("。以下为检索到的相关内容：" if n_total > 0
+                else ("，但扩展后仍未检索到相关原文内容。" if e.expanded
+                      else "，未检索到相关原文内容。"))
+        return _clause(e) + tail
+
+    # 多关键词：逐个汇报命中情况，再给总数
+    if all(e.n_direct > 0 for e in expansions):
+        names = "；".join(f"“{e.sub_query}”" for e in expansions)
+        return (
+            f"您的 {len(expansions)} 个检索词 {names} 均已在知识库中直接命中，"
+            f"共检索到 {n_total} 条相关片段，结果如下："
+        )
+    body = "；".join(_clause(e) for e in expansions)
+    if n_total > 0:
+        return body + f"。共检索到 {n_total} 条相关片段，结果如下："
+    return body + "，未检索到相关原文内容。"
+
+
+def _build_summary_section(
+    query: str, hits: list[SearchHit], search_keywords: list[str],
+    expansions: list[ExpansionInfo],
+) -> list[str]:
+    """生成检索综述段落（纯程序，无 LLM）。
+
+    格式：每个命中关键词一个自然段，段内按相关度分组引述原文，
+    并汇总检索到的图示/表格。
+    """
+    if not hits:
+        return []
+
+    def num_of(hit: SearchHit) -> int:
+        return hits.index(hit) + 1  # 资料编号与详细部分【N】一致
+
+    lines: list[str] = [
+        "\n---\n",
+        "## 检索综述\n",
+        _summary_intro(expansions, len(hits)) + "\n",
+    ]
+
+    # 按命中关键词分组（保持 hits 原有顺序）
+    kw_groups: dict[str, list[SearchHit]] = {}
+    for hit in hits:
+        kw = (hit.matched_keyword or query).strip() or query
+        kw_groups.setdefault(kw, []).append(hit)
+
+    figures: list[tuple[int, SearchHit, str, str]] = []  # (图号, hit, alt, path)
+    tables: list[tuple[int, SearchHit, str]] = []         # (表号, hit, md)
+    fig_seq = 0
+    table_seq = 0
+
+    def _ref(hit: SearchHit) -> str:
+        """正文引用标记：⟦FILE⟧ 链接，前端渲染后点击可跳转到对应文件行号。"""
+        return f"⟦FILE:{hit.file_path}⟧L{hit.line_start}⟧资料[{num_of(hit)}]⟦/FILE⟧"
+
+    def _piece(hit: SearchHit) -> str:
+        clean = _clean_for_quote(hit.text)
+        verb = _quote_verb(clean)
+        quote = _make_quote(clean, search_keywords)
+        return f"{_ref(hit)}{verb}“{quote}”"
+
+    for gi, (kw, group) in enumerate(kw_groups.items()):
+        para: list[str] = []
+        if gi > 0:
+            para.append("\n")
+        para.append(f"在{kw}方面，")
+
+        sorted_group = sorted(group, key=lambda h: h.score, reverse=True)
+        high = [h for h in sorted_group if h.score >= _HIGH_SCORE_THRESHOLD]
+        low = [h for h in sorted_group if h.score < _HIGH_SCORE_THRESHOLD]
+
+        if high:
+            para.append("；".join(_piece(h) for h in high))
+            para.append("，这些资料具有较高关联度，请重点关注。")
+        if low:
+            para.append(("此外，" if high else "") + "，".join(_piece(h) for h in low))
+            para.append("，具有一定相关性，可酌情关注。")
+
+        # 收集该组图示/表格
+        g_figs: list[tuple[int, SearchHit, str, str]] = []
+        g_tables: list[tuple[int, SearchHit, str]] = []
+        for hit in group:
+            for alt, path in _extract_figures(hit.text):
+                fig_seq += 1
+                g_figs.append((fig_seq, hit, alt, path))
+            for tbl in _extract_tables(hit.text):
+                table_seq += 1
+                g_tables.append((table_seq, hit, tbl))
+        figures.extend(g_figs)
+        tables.extend(g_tables)
+        hints: list[str] = []
+        fig_refs = [_ref(h) for _, h, _, _ in g_figs]
+        tbl_refs = [_ref(h) for _, h, _ in g_tables]
+        if fig_refs and tbl_refs and fig_refs == tbl_refs:
+            hints.append(f"{'、'.join(fig_refs)}具有如下图表")
+        else:
+            if fig_refs:
+                hints.append(f"{'、'.join(fig_refs)}具有如下图示")
+            if tbl_refs:
+                hints.append(f"{'、'.join(tbl_refs)}具有如下表格")
+        if hints:
+            para.append("此外，" + "，".join(hints) + "。")
+
+        lines.append("".join(para) + "\n")
+
+
+    # 资料来源清单：编号与正文 [N] 一致，标注原文出处（可点击跳转）
+    lines.append("\n### 资料来源\n")
+    for i, hit in enumerate(hits, 1):
+        file_name = hit.file_path.split("/")[-1]
+        parts = [
+            f"[{i}] ⟦FILE:{hit.file_path}⟧L{hit.line_start}⟧{file_name}⟦/FILE⟧",
+            f"⟦PDF:{hit.file_path}⟧[PDF]⟦/PDF⟧",
+        ]
+        if hit.meta.chapter:
+            parts.append(f"章节：{hit.meta.chapter}")
+        parts.append(f"相关度 {hit.score}%")
+        lines.append(f"- {' · '.join(parts)}\n")
+    if figures:
+        lines.append("\n### 检索图示\n")
+        for fid, hit, alt, path in figures:
+            n = num_of(hit)
+            # alt 常与路径相同（如 images/xxx.png），此时用默认图注
+            caption = alt if alt and not alt.startswith("images/") and alt != path else f"资料[{n}]图示"
+            caption = caption.replace("\n", " ")
+            lines.append(f"**图{fid}. {caption}**\n")
+            lines.append(f"![{caption}]({path})\n")
+
+    if tables:
+        lines.append("\n### 检索表格\n")
+        for tid, hit, tbl in tables:
+            n = num_of(hit)
+            rows = tbl.split("\n")
+            cells = [c.strip() for c in rows[0].strip().strip("|").split("|")]
+            # 首行为分隔行（|---|---|）时退用第二行
+            if cells and all(not c or re.fullmatch(r":?-{2,}:?", c) for c in cells):
+                if len(rows) > 1:
+                    cells = [c.strip() for c in rows[1].strip().strip("|").split("|")]
+            head = " ".join(c for c in cells if c and not re.fullmatch(r":?-{2,}:?", c))[:40].strip()
+            lines.append(f"**表{tid}. 资料[{n}]" + (f" {head}" if head else "") + "**\n")
+            lines.append(tbl + "\n")
+    lines.append("\n详细信息如下。\n")
+    return lines
+
 
 # ── 报告生成 ──────────────────────────────────────────────────────────
 def generate_report(
@@ -887,7 +1291,7 @@ def generate_report(
     round_logs: list[RoundLog],
     output_path: str,
 ) -> str:
-    """生成 Markdown 报告：检索结果在前，搜索路径日志在后。"""
+    """生成 Markdown 调研报告：检索综述（纯程序）在前，详细信息与搜索路径日志在后。"""
     # 收集所有搜索关键词（从 round_logs + 原始查询），供预览截取和前端高亮使用
     search_keywords: list[str] = []
     _seen_kw: set[str] = set()
@@ -898,59 +1302,29 @@ def generate_report(
                 search_keywords.append(kw)
     if query.strip() and query.strip() not in _seen_kw:
         search_keywords.insert(0, query.strip())
+    # 各子查询的关键词扩展信息（供综述开头汇报命中/扩展情况）
+    expansions = [e for log in round_logs for e in log.expansions]
 
     lines: list[str] = []
     # 嵌入关键词元数据（前端提取后用于高亮；HTML 注释不显示）
     lines.append(f"<!-- search-keywords: {', '.join(search_keywords)} -->\n")
-    lines.append(f"# {query}检索报告\n")
+    lines.append(f"# {query}调研报告\n")
     lines.append(f"> 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    # ── 搜索总结（放在最前面） ──
-    if hits:
-        total_rounds = len(round_logs) if round_logs else 1
-        lines.append(f"\n---\n")
-        lines.append("## 搜索总结\n")
-        lines.append(
-            f'基于您给出的关键词"{query}"，共进行了 {total_rounds} 轮次检索，'
-            f"共检索出相关文章片段 {len(hits)} 段，涉及到如下的文档：\n"
-        )
-        # 汇总表格：文件名+章节、相关度、原文前20字
-        lines.append("| 序号 | 文件名及章节位置 | 相关度 | 原文预览 |")
-        lines.append("|---|---|---|---|")
-        for i, hit in enumerate(hits, 1):
-            file_name = hit.file_path.split("/")[-1]
-            chapter = hit.meta.chapter or "—"
-            # MD 链接 + PDF 链接
-            file_cell = f"⟦FILE:{hit.file_path}⟧L{hit.line_start}⟧{file_name}⟦/FILE⟧"
-            pdf_cell = f" ⟦PDF:{hit.file_path}⟧[PDF]⟦/PDF⟧"
-            chapter_cell = chapter if len(chapter) <= 40 else chapter[:37] + "..."
-            location_cell = f"{file_cell}{pdf_cell}<br>{chapter_cell}"
-            # 原文预览：去 page 注释、去图片标记、换行转空格，然后围绕关键词截取窗口
-            preview = re.sub(r"<!--\s*page:.*?-->", "", hit.text)
-            preview = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", preview)  # 去除 Markdown 图片标记
-            preview = re.sub(r"<img[^>]*/?>", "", preview)  # 去除 HTML 图片标签
-            preview = re.sub(r"[\r\n\t]+", " ", preview)  # 换行/制表符 → 单个空格
-            preview = re.sub(r" {2,}", " ", preview).strip()
-            if not preview:
-                preview = "（纯图片片段，无文字预览）"
-            else:
-                preview = _extract_keyword_preview(preview, search_keywords, window=120)
-            preview = preview.replace("|", "\\|")
-            lines.append(f"| {i} | {location_cell} | {hit.score}% | {preview} |")
-        lines.append("\n以下是详细情况。\n")
+    # ── 检索综述（纯程序生成：按关键词分段 + 相关度分组引述 + 图示表格汇总） ──
+    lines.extend(_build_summary_section(query, hits, search_keywords, expansions))
 
-    # ── 检索结果（详细，在总结之后） ──
-    lines.append(f"\n---\n")
-    lines.append("## 检索结果\n")
+    # ── 详细信息（综述之后的完整原文摘抄） ──
+    lines.append("\n---\n")
 
+    lines.append("## 详细信息\n")
     if not hits:
-        lines.append("> 多轮检索完成，未在 Markdown 仓库中查询到相关原文内容。\n")
+        lines.append("> " + _summary_intro(expansions, 0) + "\n")
     else:
         for i, hit in enumerate(hits, 1):
             lines.append(f"### 【{i}】原文摘抄\n")
-            # 原文内容直接作为 Markdown 渲染（不包裹在代码块中）
-            # 去掉原文中的 page 注释行（避免重复显示元数据）
-            clean_text = re.sub(r"<!--\s*page:.*?-->", "", hit.text).strip()
-            lines.append(clean_text + "\n")
+            # 摘抄转纯文本：剥离全部 markdown/HTML 格式符（含未闭合围栏与
+            # 裸标签，二者曾导致渲染时吞掉后续所有块），仅保留文字
+            lines.append(_to_plain_text(hit.text) + "\n")
             # 元信息放在引用块中
             meta_parts = []
             if hit.meta.chapter:
@@ -966,12 +1340,12 @@ def generate_report(
                 lines.append(f"> {hit.meta}\n")
 
     # ── 多轮搜索路径日志（放在最后） ──
-    lines.append(f"\n---\n")
+    lines.append("\n---\n")
     lines.append("## 多轮搜索路径日志\n")
 
     for log in round_logs:
-        lines.append(f"### 第 {log.round_num} 轮搜索\n")
-        lines.append(f"- **检索关键词**：{', '.join(log.keywords)}")
+        label = f"（查询：{log.query_label}）" if log.query_label else ""
+        lines.append(f"### 第 {log.round_num} 轮搜索{label}\n")
         if log.hit_files:
             short_files = [
                 f if len(f) <= 60 else "..." + f[-57:]
@@ -999,7 +1373,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
   python rag_search.py -q "Data Pipeline" -d ~/pymupdftest
-  python rag_search.py -d ~/docs          # 交互模式
+  python rag_search.py -q "HBM 带宽; chiplet 互连" -d ~/docs   # 多关键词（分号分隔）
+  python rag_search.py -d ~/docs --no-llm                     # 不用大模型，jieba 分词扩展
 """,
     )
     ap.add_argument("-q", "--query", help="搜索查询（不指定则进入交互模式）")
@@ -1011,13 +1386,21 @@ def main() -> None:
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"LLM 模型名（默认 {DEFAULT_MODEL}）")
     ap.add_argument("--api-key", default=None, help="智谱 API Key（默认环境变量或内置）")
     ap.add_argument("--base-url", default=None, help="API 地址（默认智谱）")
+    ap.add_argument("--no-llm", action="store_true",
+                    help="禁用大模型，关键词扩展使用 jieba 本地分词（也可在 config.json 设 use_llm: false）")
     args = ap.parse_args()
 
-    # API 配置
-    api_key = args.api_key or os.environ.get("ZHIPU_API_KEY") or DEFAULT_API_KEY
-    base_url = args.base_url or os.environ.get("ZHIPU_BASE_URL") or DEFAULT_BASE_URL
+    # 优先级：CLI 参数 > config.json > 环境变量（config.json 为项目配置真源，
+    # 避免残留的 ZHIPU_* 环境变量压过文件配置）
+    api_key = args.api_key or DEFAULT_API_KEY or os.environ.get("ZHIPU_API_KEY")
+    base_url = args.base_url or DEFAULT_BASE_URL or os.environ.get("ZHIPU_BASE_URL")
 
-    agent = LLMAgent(api_key=api_key, base_url=base_url, model=args.model)
+    # 大模型开关：config.json use_llm / --no-llm 控制；未配置 Key 时自动降级 jieba
+    use_llm = DEFAULT_USE_LLM and not args.no_llm
+    if use_llm and not api_key:
+        print("提示：未配置 API Key，关键词扩展使用 jieba 本地分词")
+        use_llm = False
+    agent = LLMAgent(api_key=api_key, base_url=base_url, model=args.model) if use_llm else None
 
     # 查询来源
     query = args.query
@@ -1025,7 +1408,7 @@ def main() -> None:
         print("=" * 60)
         print("  零幻觉 Agentic RAG — Markdown 仓库多轮检索")
         print("  输入查询后按回车，输入 q 退出")
-        print("=" * 60)
+        print("  多个关键词用分号（;或；）分隔；扩展方式：LLM 或 jieba（--no-llm）")
         while True:
             try:
                 query = input("\n🔍 请输入查询: ").strip()
@@ -1044,11 +1427,11 @@ def main() -> None:
     print(f"\n查询：{query}")
     print(f"目录：{args.dir}")
     print(f"输出：{output}")
-    print(f"模型：{args.model}")
+    print(f"关键词扩展：{'LLM（' + args.model + '）' if use_llm else 'jieba 本地分词'}")
     print(f"最大轮次：{args.max_rounds}")
 
     t0 = time.time()
-    hits, logs = run_rag_search(query, args.dir, agent, args.max_rounds)
+    hits, logs = run_rag_search(query, args.dir, agent, args.max_rounds, use_llm=use_llm)
     elapsed = time.time() - t0
 
     # 生成报告
@@ -1070,9 +1453,9 @@ def main() -> None:
                 return
             if not query:
                 continue
+            hits, logs = run_rag_search(query, args.dir, agent, args.max_rounds, use_llm=use_llm)
             output = f"rag-result-{time.strftime('%Y%m%d-%H%M%S')}.md"
             t0 = time.time()
-            hits, logs = run_rag_search(query, args.dir, agent, args.max_rounds)
             elapsed = time.time() - t0
             generate_report(query, hits, logs, output)
             print(f"\n✅ 完成！耗时 {elapsed:.1f}s，报告：{output}")

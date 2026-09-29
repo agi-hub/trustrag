@@ -127,14 +127,14 @@ function App() {
       return `具体章节：<span class="chapter-info" data-meta="chapter: ${escapeAttr(chapterTrim)}">${chapterTrim}</span>`;
     });
     // 搜索总结表格中的 ⟦FILE:path⟧L行号⟧name⟦/FILE⟧ → 可点击超链接
-    html = html.replace(/⟦FILE:(.+?)⟧L(\d+)⟧(.+?)⟦\/FILE⟧/g, (match, path, lineNum, name) => {
+    html = html.replace(/⟦FILE:(.+?)⟧L(\d+)⟧(.+?)[⟦⟧]\/FILE⟧/g, (match, path, lineNum, name) => {
       return `<a class="file-path-link" data-file-path="${escapeAttr(path)}" data-line="${lineNum}">${name}</a>`;
     });
     // PDF 链接 ⟦PDF:basename⟧label⟦/PDF⟧ → 可点击超链接
-    html = html.replace(/⟦PDF:(.+?)⟧(.+?)⟦\/PDF⟧/g, (match, baseName, label) => {
+    html = html.replace(/⟦PDF:(.+?)⟧(.+?)[⟦⟧]\/PDF⟧/g, (match, baseName, label) => {
       return `<a class="pdf-link" data-pdf-name="${escapeAttr(baseName)}">${label}</a>`;
     });
-    // 关键词高亮：从报告元数据提取关键词，在文本节点中标黄
+    // 关键词高亮：从报告元数据提取关键词，在文本节点中加粗
     const kwMatch = md.match(/<!--\s*search-keywords:\s*(.*?)\s*-->/);
     if (kwMatch) {
       const kws = [...new Set(kwMatch[1].split(',').map(k => k.trim()).filter(k => k.length > 1))];
@@ -143,20 +143,54 @@ function App() {
         const pattern = sorted.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
         const kwRegex = new RegExp(`(${pattern})`, 'gi');
         html = html.replace(/>([^<]+)</g, (match, text) =>
-          '>' + text.replace(kwRegex, '<mark class="kw-hl">$1</mark>') + '<');
+          '>' + text.replace(kwRegex, '<strong>$1</strong>') + '<');
       }
     }
     return html;
   };
 
-  // ── 打开文件标签页（定位到文档开头） ──
-  const openFileTab = useCallback(async (filePath) => {
+  // ── 定位到指定行：在渲染后的 DOM 中查找该行文本并滚动高亮 ──
+  const jumpToLine = useCallback((tab, line) => {
+    const el = previewRefs.current[tab.id];
+    if (!el || !tab.md || !line) return;
+    const norm = (s) => String(s)
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/[|*`_#>-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const lines = tab.md.split('\n');
+    let target = '';
+    for (let off = 0; off < 5; off++) { // 目标行可能是 page 注释行，向下找几行
+      const t = norm(lines[line - 1 + off] || '');
+      if (t.length >= 4) { target = t.slice(0, 80); break; }
+    }
+    if (!target) return;
+    const blocks = el.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, td, th, tr, pre');
+    for (const b of blocks) {
+      if (norm(b.textContent).includes(target)) {
+        b.scrollIntoView({ block: 'start' });
+        b.style.outline = '2px solid #6366f1';
+        setTimeout(() => { b.style.outline = ''; }, 1500);
+        return;
+      }
+    }
+  }, []);
+
+  // 待执行的行跳转（等标签页 DOM 渲染完成后消费）
+  const pendingJumpRef = useRef(null);
+
+  // ── 打开文件标签页（带行号时定位到对应位置） ──
+  const openFileTab = useCallback(async (filePath, line) => {
     // 已有该文件的标签页，直接切换
     const existing = tabs.find(t => t.type === 'file' && t.filePath === filePath);
     if (existing) {
       setActiveTabId(existing.id);
-      const el = previewRefs.current[existing.id];
-      if (el) el.scrollTop = 0;
+      if (line) {
+        pendingJumpRef.current = { filePath, line };
+      } else {
+        const el = previewRefs.current[existing.id];
+        if (el) el.scrollTop = 0;
+      }
       return;
     }
     try {
@@ -174,10 +208,19 @@ function App() {
         html,
         filePath,
       });
+      if (line) pendingJumpRef.current = { filePath, line };
     } catch (err) {
       console.error('打开文件失败:', err);
     }
   }, [tabs, openTab]);
+
+  // 渲染完成后执行待处理的行跳转
+  useEffect(() => {
+    const pj = pendingJumpRef.current;
+    if (!pj || !activeTab || activeTab.type !== 'file' || activeTab.filePath !== pj.filePath) return;
+    pendingJumpRef.current = null;
+    jumpToLine(activeTab, pj.line);
+  }, [activeTabId, activeTab, jumpToLine]);
 
   // ── 打开 PDF 标签页 ──
   const openPdfTab = useCallback(async (pdfBaseName) => {
@@ -204,11 +247,11 @@ function App() {
           html: `<iframe src="${data.url}" style="width:100%;height:calc(100vh - 120px);border:none;"></iframe>`,
         });
       } else {
-        alert('未找到对应的 PDF 文件');
+        // 死链兜底：正常情况下渲染后已被剔除，这里不再弹窗
+        console.warn('未找到对应的 PDF 文件:', pdfBaseName);
       }
     } catch (err) {
       console.error('打开PDF失败:', err);
-      alert('打开PDF失败: ' + err.message);
     }
   }, [tabs, openTab]);
 
@@ -242,7 +285,7 @@ function App() {
       const fileLink = e.target.closest('.file-path-link');
       if (fileLink) {
         e.preventDefault();
-        openFileTab(fileLink.dataset.filePath);
+        openFileTab(fileLink.dataset.filePath, parseInt(fileLink.dataset.line, 10) || undefined);
         return;
       }
       // page-meta-link → 打开 MD 文件
@@ -260,6 +303,49 @@ function App() {
     el.addEventListener('click', handler);
     return () => el.removeEventListener('click', handler);
   }, [activeTabId, activeTab, openFileTab, openPdfTab]);
+
+  // ── 报告渲染后：剔除找不到对应 PDF 的死链（纯 md / Word 等无 PDF 来源） ──
+  useEffect(() => {
+    if (!activeTab || activeTab.type !== 'report') return;
+    const el = previewRefs.current[activeTab.id];
+    if (!el) return;
+    let cancelled = false;
+    const links = [...el.querySelectorAll('a.pdf-link')];
+    if (!links.length) return;
+    const uniqueNames = [...new Set(links.map(a => a.dataset.pdfName))];
+    Promise.allSettled(uniqueNames.map(async name => {
+      const resp = await fetch('api/find-pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mdPath: name }),
+      });
+      const data = await resp.json();
+      return [name, Boolean(data.found)];
+    })).then(results => {
+      if (cancelled) return;
+      const dead = new Set(
+        results
+          .filter(r => r.status === 'fulfilled' && !r.value[1])
+          .map(r => r.value[0])
+      );
+      if (!dead.size) return;
+      for (const a of el.querySelectorAll('a.pdf-link')) {
+        if (!dead.has(a.dataset.pdfName)) continue;
+        const prev = a.previousSibling;
+        const next = a.nextSibling;
+        if (next && next.nodeType === Node.TEXT_NODE) {
+          next.textContent = next.textContent.replace(/^\s*[·|]\s*/, '');
+        }
+        if (prev && prev.nodeType === Node.TEXT_NODE) {
+          prev.textContent = prev.textContent
+            .replace(/\s*PDF文件：\s*$/, '')
+            .replace(/\s*[·|]\s*$/, '');
+        }
+        a.remove();
+      }
+    });
+    return () => { cancelled = true; };
+  }, [activeTab]);
 
   // ── 回车搜索 ──
   const handleKeyDown = (e) => {
@@ -285,29 +371,78 @@ function App() {
     }
   }, [activeTab]);
 
-  // ── AI 整理总结 ──
+  // ── AI 整理总结（SSE 流式文本模式：LLM 全程输出 Markdown 纯文本，无 JSON 格式约束） ──
   const handleSummarize = useCallback(async () => {
     if (!activeTab || !activeTab.md || activeTab.type !== 'report') return;
     setSummarizing(true);
+    const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const tabId = openTab({
+      title: `AI总结: ${activeTab.title.replace(/[🔍📄🤖]/g, '').trim()}`,
+      type: 'report',
+      md: '',
+      // 占位必须非空：html 为空时 React 渲染空态分支，预览容器不挂载，流式内容无处写入
+      html: '<div class="ai-stream-preview">正在连接模型…</div>',
+    });
+    let paintTimer = null;
     try {
       const resp = await fetch('api/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: activeTab.title.replace(/[🔍📄]/g, '').trim(), reportMd: activeTab.md }),
       });
-      const data = await resp.json();
-      if (data.summary) {
-        openTab({
-          title: `AI总结: ${activeTab.title.replace(/[🔍📄🤖]/g, '').trim()}`,
-          type: 'report',
-          md: data.summary,
-          html: renderReportHtml(data.summary),
-        });
+      if (!resp.ok || !resp.body) {
+        const errText = await resp.text().catch(() => '');
+        throw new Error(`服务端错误 HTTP ${resp.status} ${errText.slice(0, 150)}`);
       }
+      // 逐帧解析 SSE 事件（chunk/done/error）；LLM 正文始终按纯文本累积
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buf = '', acc = '', finalSummary = '';
+      const paint = () => {
+        const el = previewRefs.current[tabId];
+        if (el) {
+          el.innerHTML = `<pre class="ai-stream-preview">${esc(acc)}▌</pre>`;
+        } else if (!paintTimer) {
+          // React 渲染异步，容器 ref 尚未挂载时稍后重试
+          paintTimer = setTimeout(paint, 100);
+        }
+      };
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const frames = buf.split('\n\n');
+        buf = frames.pop() || '';
+        for (const frame of frames) {
+          const dataLine = frame.split('\n').find(l => l.startsWith('data: '));
+          if (!dataLine) continue;
+          let evt;
+          try { evt = JSON.parse(dataLine.slice(6)); } catch { continue; }
+          if (evt.type === 'chunk') {
+            acc += evt.text || '';
+            paint();
+          } else if (evt.type === 'done') {
+            finalSummary = evt.summary || acc;
+          } else if (evt.type === 'error') {
+            throw new Error(evt.error || 'AI 整理失败');
+          }
+        }
+      }
+      if (!finalSummary) finalSummary = acc;
+      if (!finalSummary.trim()) throw new Error('AI 未返回任何内容');
+      // 流结束：渲染最终版（引用后处理已完成），并同步回 tab 状态供导出/切换
+      const html = renderReportHtml(finalSummary);
+      setTabs(prev => prev.map(t => t.id === tabId ? { ...t, md: finalSummary, html } : t));
+      const el = previewRefs.current[tabId];
+      if (el) el.innerHTML = html;
     } catch (err) {
       console.error('AI整理失败:', err);
-      alert('AI整理失败: ' + err.message);
+      const errHtml = `<div class="ai-stream-error">AI 整理失败：${esc(err.message)}</div>`;
+      setTabs(prev => prev.map(t => t.id === tabId ? { ...t, md: `> AI 整理失败：${err.message}`, html: errHtml } : t));
+      const el = previewRefs.current[tabId];
+      if (el) el.innerHTML = errHtml;
     } finally {
+      clearTimeout(paintTimer);
       setSummarizing(false);
     }
   }, [activeTab, openTab]);
@@ -324,7 +459,7 @@ function App() {
           <input
             type="text"
             className="search-input"
-            placeholder="输入搜索关键词，按回车搜索 Markdown 文档..."
+            placeholder="输入搜索关键词（多个用分号 ; 分隔），按回车搜索..."
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
